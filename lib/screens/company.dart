@@ -2524,7 +2524,22 @@ class _CreateCompanyScreenState extends State<CreateCompanyScreen> with TickerPr
   }
 
   void _onDragStart(Offset position) {
-    // Check for shape selection first
+    // FIRST priority: resize handles on the currently selected shape,
+    // even when the touch point is slightly outside the shape boundary.
+    if (selectedShape_canvas != null && !selectedShape_canvas!.isLocked) {
+      String? handle = _getResizeHandle(position, selectedShape_canvas!);
+      if (handle != null) {
+        setState(() {
+          isResizing = true;
+          resizeHandle = handle;
+          isLongPressMode = true;
+          longPressShape = selectedShape_canvas;
+        });
+        return;
+      }
+    }
+
+    // SECOND: check which shape (if any) was touched
     CanvasShape? targetShape;
     for (var shape in shapes.reversed) {
       if (_isPointInShape(position, shape)) {
@@ -2532,9 +2547,9 @@ class _CreateCompanyScreenState extends State<CreateCompanyScreen> with TickerPr
         break;
       }
     }
-    
+
     if (targetShape != null) {
-      // Don't proceed if shape is locked
+      // Don't drag locked shapes
       if (targetShape.isLocked) {
         setState(() {
           selectedShape_canvas = targetShape;
@@ -2544,21 +2559,8 @@ class _CreateCompanyScreenState extends State<CreateCompanyScreen> with TickerPr
         });
         return;
       }
-      
-      // FIRST: Check if clicking on resize handles (higher priority)
-      String? handle = _getResizeHandle(position, targetShape);
-      if (handle != null && selectedShape_canvas == targetShape) {
-        // Start resizing immediately
-        setState(() {
-          isResizing = true;
-          resizeHandle = handle;
-          isLongPressMode = true;
-          longPressShape = targetShape;
-        });
-        return; // Don't start dragging
-      }
-      
-      // SECOND: If not on handle, start normal dragging
+
+      // Normal drag
       setState(() {
         selectedShape_canvas = targetShape;
         selectedColor = targetShape!.color;
@@ -2569,7 +2571,7 @@ class _CreateCompanyScreenState extends State<CreateCompanyScreen> with TickerPr
         dragOffset = position - targetShape.position;
       });
     } else {
-      // Clicked on empty canvas
+      // Touched empty canvas — deselect
       setState(() {
         selectedShape_canvas = null;
         isLongPressMode = false;

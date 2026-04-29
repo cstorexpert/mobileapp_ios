@@ -772,15 +772,9 @@ class _BulkUploadDialogState extends State<_BulkUploadDialog> {
       final bulkData = {
         'shortcodes': _parsedShortCodes!.map((sc) => sc.toJson()).toList(),
       };
-      
-      
-      // const url = '${AppConfig.baseUrl}shortcode/bulk';
-      // final response = await ApiService(DioService()).postRequest(
-      //       url, 
-      //       bulkData
-      //     );
 
-      final response = {};
+      const url = '${AppConfig.baseUrl}shortcode/bulk';
+      final response = await ApiService(DioService()).postRequest(url, bulkData);
       
       // Parse response to create results
       List<ExcelImportResult> results = [];
@@ -1037,7 +1031,7 @@ class _BulkUploadDialogState extends State<_BulkUploadDialog> {
                         ),
                         child: Row(
                           children: [
-                            Icon(Icons.check_circle, color: const Color.fromARGB(255, 3, 25, 55)),
+                            Icon(Icons.check_circle, color: Colors.white),
                             SizedBox(width: 12),
                             Expanded(
                               child: Column(
@@ -1048,7 +1042,7 @@ class _BulkUploadDialogState extends State<_BulkUploadDialog> {
                                     style: TextStyle(
                                       fontSize: 16,
                                       fontWeight: FontWeight.bold,
-                                      color: const Color.fromARGB(255, 3, 25, 55),
+                                      color: Colors.white,
                                     ),
                                   ),
                                   if (_parsedShortCodes!.isNotEmpty)
@@ -1056,7 +1050,7 @@ class _BulkUploadDialogState extends State<_BulkUploadDialog> {
                                       'Ready to upload',
                                       style: TextStyle(
                                         fontSize: 14,
-                                        color: const Color.fromARGB(255, 3, 25, 55),
+                                        color: Colors.white70,
                                       ),
                                     ),
                                 ],
@@ -1521,7 +1515,7 @@ class _ShortCodeDialogState extends State<_ShortCodeDialog> {
                             if (value.trim().length < 2) {
                               return 'Shortcode must be at least 2 characters';
                             }
-                            if (!RegExp(r'^[A-Z0-9_]+').hasMatch(value.trim().toUpperCase())) {
+                            if (!RegExp(r'^[A-Z0-9_]+$').hasMatch(value.trim().toUpperCase())) {
                               return 'Shortcode can only contain letters, numbers, and underscores';
                             }
                             return null;
@@ -1579,7 +1573,7 @@ class _ShortCodeDialogState extends State<_ShortCodeDialog> {
                               style: TextStyle(
                                 fontSize: 14,
                                 fontWeight: FontWeight.bold,
-                                color: const Color.fromARGB(255, 3, 25, 55),
+                                color: Colors.white,
                               ),
                             ),
                             SizedBox(height: 8),
@@ -1588,12 +1582,13 @@ class _ShortCodeDialogState extends State<_ShortCodeDialog> {
                                 Container(
                                   padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                                   decoration: BoxDecoration(
-                                    color: const Color.fromARGB(255, 3, 25, 55),
+                                    color: Colors.white.withOpacity(0.15),
                                     borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(color: Colors.white54),
                                   ),
                                   child: Text(
-                                    _shortcodeController.text.toUpperCase().isEmpty 
-                                        ? 'SHORTCODE' 
+                                    _shortcodeController.text.toUpperCase().isEmpty
+                                        ? 'SHORTCODE'
                                         : _shortcodeController.text.toUpperCase(),
                                     style: TextStyle(
                                       color: Colors.white,
@@ -1606,14 +1601,16 @@ class _ShortCodeDialogState extends State<_ShortCodeDialog> {
                                 SizedBox(width: 12),
                                 Expanded(
                                   child: Text(
-                                    _longcodeController.text.isEmpty 
-                                        ? 'Description will appear here' 
+                                    _longcodeController.text.isEmpty
+                                        ? 'Description will appear here'
                                         : _longcodeController.text,
                                     style: TextStyle(
                                       fontSize: 14,
-                                      color: Colors.grey.shade700,
-                                      fontStyle: _longcodeController.text.isEmpty 
-                                          ? FontStyle.italic 
+                                      color: _longcodeController.text.isEmpty
+                                          ? Colors.white54
+                                          : Colors.white,
+                                      fontStyle: _longcodeController.text.isEmpty
+                                          ? FontStyle.italic
                                           : FontStyle.normal,
                                     ),
                                   ),
