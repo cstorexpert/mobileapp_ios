@@ -678,7 +678,7 @@ void handleBarcodeScan(String barcode) {
                     focusNode: scanCodeFocusNode,
                     decoration: InputDecoration(
                       labelText: 'Scan Code',
-                      prefixIcon: FaIcon(FontAwesomeIcons.barcode, size: 16),
+                      prefixIcon: Icon(FontAwesomeIcons.barcode, size: 16),
                       border: OutlineInputBorder(),
                       suffixIcon: _isCodeRecognized(scanCodeController.text) 
                         ? Icon(Icons.check_circle, color: Colors.green)
@@ -703,7 +703,7 @@ void handleBarcodeScan(String barcode) {
                     focusNode: codeFocusNode,
                     decoration: InputDecoration(
                       labelText: 'Item Code',
-                      prefixIcon: FaIcon(FontAwesomeIcons.hashtag, size: 16),
+                      prefixIcon: Icon(FontAwesomeIcons.hashtag, size: 16),
                       border: OutlineInputBorder(),
                     ),
                     onFieldSubmitted: (value) => nameFocusNode.requestFocus(),
@@ -716,7 +716,7 @@ void handleBarcodeScan(String barcode) {
                     focusNode: nameFocusNode,
                     decoration: InputDecoration(
                       labelText: 'Item Description',
-                      prefixIcon: FaIcon(FontAwesomeIcons.tag, size: 16),
+                      prefixIcon: Icon(FontAwesomeIcons.tag, size: 16),
                       border: OutlineInputBorder(),
                     ),
                     onFieldSubmitted: (value) => departmentFocusNode.requestFocus(),
@@ -729,7 +729,7 @@ void handleBarcodeScan(String barcode) {
                     focusNode: departmentFocusNode,
                     decoration: InputDecoration(
                       labelText: 'Department',
-                      prefixIcon: FaIcon(FontAwesomeIcons.building, size: 16),
+                      prefixIcon: Icon(FontAwesomeIcons.building, size: 16),
                       border: OutlineInputBorder(),
                     ),
                     onFieldSubmitted: (value) => rateFocusNode.requestFocus(),
@@ -743,7 +743,7 @@ void handleBarcodeScan(String barcode) {
                     keyboardType: TextInputType.number,
                     decoration: InputDecoration(
                       labelText: 'Price Group / Rate',
-                      prefixIcon: FaIcon(FontAwesomeIcons.dollarSign, size: 16),
+                      prefixIcon: Icon(FontAwesomeIcons.dollarSign, size: 16),
                       border: OutlineInputBorder(),
                     ),
                     onFieldSubmitted: (value) => quantityFocusNode.requestFocus(),
@@ -757,7 +757,7 @@ void handleBarcodeScan(String barcode) {
                     keyboardType: TextInputType.number,
                     decoration: InputDecoration(
                       labelText: 'Current Quantity *',
-                      prefixIcon: FaIcon(FontAwesomeIcons.boxesStacked, size: 16),
+                      prefixIcon: Icon(FontAwesomeIcons.boxesStacked, size: 16),
                       border: OutlineInputBorder(
                         borderSide: BorderSide(
                           color: quantityFocusNode.hasFocus ? const Color.fromARGB(255, 3, 25, 55) : Colors.grey,
@@ -782,7 +782,7 @@ void handleBarcodeScan(String barcode) {
                       Expanded(
                         child: ElevatedButton.icon(
                           onPressed: addOrUpdateStock,
-                          icon: FaIcon(FontAwesomeIcons.plus, size: 16),
+                          icon: Icon(FontAwesomeIcons.plus, size: 16),
                           label: Text('Add/Update'),
                           style: ElevatedButton.styleFrom(
                             backgroundColor: Colors.green,
@@ -796,7 +796,7 @@ void handleBarcodeScan(String barcode) {
                       //     clearForm();
                       //     scanCodeFocusNode.requestFocus();
                       //   },
-                      //   icon: FaIcon(FontAwesomeIcons.eraser, size: 16),
+                      //   icon: Icon(FontAwesomeIcons.eraser, size: 16),
                       //   label: Text('Clear'),
                       //   style: ElevatedButton.styleFrom(
                       //     backgroundColor: Colors.orange,
@@ -809,7 +809,7 @@ void handleBarcodeScan(String barcode) {
                           restartScanner(); // Add this line
                           scanCodeFocusNode.requestFocus();
                         },
-                        icon: FaIcon(FontAwesomeIcons.eraser, size: 16),
+                        icon: Icon(FontAwesomeIcons.eraser, size: 16),
                         label: Text('Clear'),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.orange,
@@ -891,7 +891,7 @@ void handleBarcodeScan(String barcode) {
                                   ],
                                 ),
                                 IconButton(
-                                  icon: FaIcon(FontAwesomeIcons.trash, size: 16, color: Colors.red),
+                                  icon: Icon(FontAwesomeIcons.trash, size: 16, color: Colors.red),
                                   onPressed: () {
                                     setState(() {
                                       currentStock.remove(entry.key);
@@ -1124,7 +1124,7 @@ void handleBarcodeScan(String barcode) {
                 if (currentStep > 0)
                   ElevatedButton.icon(
                     onPressed: () => setState(() => currentStep--),
-                    icon: FaIcon(FontAwesomeIcons.arrowLeft, size: 16),
+                    icon: Icon(FontAwesomeIcons.arrowLeft, size: 16),
                     label: Text('Back'),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.grey,
@@ -1138,7 +1138,7 @@ void handleBarcodeScan(String barcode) {
                     if (currentStep == 3)
                       ElevatedButton.icon(
                         onPressed: generatePDFReport,
-                        icon: FaIcon(FontAwesomeIcons.filePdf, size: 16),
+                        icon: Icon(FontAwesomeIcons.filePdf, size: 16),
                         label: Text('Generate PDF'),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.red,
@@ -1157,7 +1157,7 @@ void handleBarcodeScan(String barcode) {
                             setState(() => currentStep++);
                           }
                         },
-                        icon: FaIcon(FontAwesomeIcons.arrowRight, size: 16),
+                        icon: Icon(FontAwesomeIcons.arrowRight, size: 16),
                         label: Text('Next'),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: const Color.fromARGB(255, 3, 25, 55),
@@ -1172,7 +1172,7 @@ void handleBarcodeScan(String barcode) {
                             SnackBar(content: Text('Stock saved successfully!')),
                           );
                         },
-                        icon: FaIcon(FontAwesomeIcons.save, size: 16),
+                        icon: Icon(FontAwesomeIcons.save, size: 16),
                         label: Text('Save'),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.green,
@@ -1309,7 +1309,7 @@ void handleBarcodeScan(String barcode) {
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    FaIcon(FontAwesomeIcons.fileExcel, color: Colors.green),
+                    Icon(FontAwesomeIcons.fileExcel, color: Colors.green),
                     SizedBox(width: 12),
                     Flexible(
                       child: Text(
@@ -1426,7 +1426,7 @@ void handleBarcodeScan(String barcode) {
                     padding: EdgeInsets.all(16),
                     child: Column(
                       children: [
-                        FaIcon(FontAwesomeIcons.plus, color: Colors.green, size: 24),
+                        Icon(FontAwesomeIcons.plus, color: Colors.green, size: 24),
                         SizedBox(height: 8),
                         Text(
                           '${added.length}',
@@ -1446,7 +1446,7 @@ void handleBarcodeScan(String barcode) {
                     padding: EdgeInsets.all(16),
                     child: Column(
                       children: [
-                        FaIcon(FontAwesomeIcons.arrowsRotate, color: const Color.fromARGB(255, 3, 25, 55), size: 24),
+                        Icon(FontAwesomeIcons.arrowsRotate, color: const Color.fromARGB(255, 3, 25, 55), size: 24),
                         SizedBox(height: 8),
                         Text(
                           '${updated.length}',
@@ -1466,7 +1466,7 @@ void handleBarcodeScan(String barcode) {
                     padding: EdgeInsets.all(16),
                     child: Column(
                       children: [
-                        FaIcon(FontAwesomeIcons.minus, color: Colors.red, size: 24),
+                        Icon(FontAwesomeIcons.minus, color: Colors.red, size: 24),
                         SizedBox(height: 8),
                         Text(
                           '${removed.length}',
@@ -1493,7 +1493,7 @@ void handleBarcodeScan(String barcode) {
                   children: [
                     Row(
                       children: [
-                        FaIcon(FontAwesomeIcons.plus, color: Colors.green, size: 16),
+                        Icon(FontAwesomeIcons.plus, color: Colors.green, size: 16),
                         SizedBox(width: 8),
                         Text(
                           'New Items Added',
@@ -1505,7 +1505,7 @@ void handleBarcodeScan(String barcode) {
                     ...added.values.map((item) => ListTile(
                       leading: CircleAvatar(
                         backgroundColor: Colors.green.shade100,
-                        child: FaIcon(FontAwesomeIcons.plus, size: 12, color: Colors.green),
+                        child: Icon(FontAwesomeIcons.plus, size: 12, color: Colors.green),
                       ),
                       title: Text(item.name),
                       subtitle: Text('Code: ${item.code} | Scan: ${item.scanCode}'),
@@ -1530,7 +1530,7 @@ void handleBarcodeScan(String barcode) {
                   children: [
                     Row(
                       children: [
-                        FaIcon(FontAwesomeIcons.arrowsRotate, color: const Color.fromARGB(255, 3, 25, 55), size: 16),
+                        Icon(FontAwesomeIcons.arrowsRotate, color: const Color.fromARGB(255, 3, 25, 55), size: 16),
                         SizedBox(width: 8),
                         Text(
                           'Updated Items',
@@ -1546,7 +1546,7 @@ void handleBarcodeScan(String barcode) {
                       return ListTile(
                         leading: CircleAvatar(
                           backgroundColor: const Color.fromARGB(255, 3, 25, 55),
-                          child: FaIcon(FontAwesomeIcons.arrowsRotate, size: 12, color: const Color.fromARGB(255, 3, 25, 55)),
+                          child: Icon(FontAwesomeIcons.arrowsRotate, size: 12, color: const Color.fromARGB(255, 3, 25, 55)),
                         ),
                         title: Text(entry.value.name),
                         subtitle: Text('Code: ${entry.value.code} | Scan: ${entry.value.scanCode}'),
@@ -1585,7 +1585,7 @@ void handleBarcodeScan(String barcode) {
                   children: [
                     Row(
                       children: [
-                        FaIcon(FontAwesomeIcons.minus, color: Colors.red, size: 16),
+                        Icon(FontAwesomeIcons.minus, color: Colors.red, size: 16),
                         SizedBox(width: 8),
                         Text(
                           'Removed Items',
@@ -1597,7 +1597,7 @@ void handleBarcodeScan(String barcode) {
                     ...removed.values.map((item) => ListTile(
                       leading: CircleAvatar(
                         backgroundColor: Colors.red.shade100,
-                        child: FaIcon(FontAwesomeIcons.minus, size: 12, color: Colors.red),
+                        child: Icon(FontAwesomeIcons.minus, size: 12, color: Colors.red),
                       ),
                       title: Text(item.name),
                       subtitle: Text('Code: ${item.code} | Scan: ${item.scanCode}'),

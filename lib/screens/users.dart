@@ -965,7 +965,8 @@ class _BulkUploadDialogState extends State<BulkUploadDialog> {
   void _parseCSV(List<int> bytes) {
     try {
       final String csvString = utf8.decode(bytes);
-      final csvTable = CsvToListConverter().convert(csvString);      
+      final List<List<dynamic>> csvTable = CsvToListConverter().convert(csvString);
+      
       if (csvTable.isEmpty) {
         setState(() {
           _errors = ['CSV file is empty'];
