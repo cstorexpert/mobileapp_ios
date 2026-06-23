@@ -35,6 +35,11 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // ML Kit text recognition references optional script modules (Chinese, etc.) that are
+            // not in the APK; R8 then fails with "Missing class". Disable shrinking for release
+            // until ProGuard keep rules are added for those optional paths.
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }

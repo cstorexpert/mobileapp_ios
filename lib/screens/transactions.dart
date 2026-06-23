@@ -12,6 +12,8 @@ import 'package:printing/printing.dart';
 import 'package:countx/config/config.dart';
 import 'package:countx/services/api_services.dart';
 import 'package:countx/services/dio_services.dart';
+import 'package:countx/screens/live_scan_screen.dart';
+import 'package:countx/utils/scan_code_utils.dart';
 
 
 import 'package:file_picker/file_picker.dart';
@@ -1947,8 +1949,8 @@ class _StockManagementScreenState extends State<StockManagementScreen>
     }
     
     // NEW: Validate against previous stock
-    final inputScanCode = scanCodeController.text.trim();
-    if (!previousStock.containsKey(inputScanCode)) {
+    final inputScanCode = normalizeScanCode(scanCodeController.text);
+    if (lookupStockByScanCode(previousStock, inputScanCode) == null) {
       _showErrorSnackBar('Item not found in previous stock. Please verify scan code.');
       return;
     }
@@ -1997,6 +1999,82 @@ class _StockManagementScreenState extends State<StockManagementScreen>
       
     } catch (e) {
       _showErrorSnackBar('Error: ${e.toString()}');
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Phase 1: Live Scan integration
+  // Opens a full-screen always-on scanner. Callback aggregates qty against
+  // current section state and pushes through the existing buffer/sync flow.
+  //
+  // Phase 3: Rapid re-scan; unknown barcode → Add to sheet (in-memory) +
+  // __source manual for missing-items report. Classic MobileScanner optional.
+  // ---------------------------------------------------------------------------
+
+  Future<void> _openLiveScan() async {
+    if (previousStock.isEmpty) {
+      _showErrorSnackBar('Please upload the Excel sheet before live scanning.');
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => LiveScanScreen(
+          previousStock: previousStock,
+          sectionName: widget.sectionName,
+          allocatedDepartment: widget.sectionName,
+          onAdd: _onLiveScanAdd,
+          onPreviousStockChanged: () {
+            if (mounted) setState(() {});
+          },
+        ),
+        fullscreenDialog: true,
+      ),
+    );
+    // After returning, refresh local stock list view.
+    if (mounted) setState(() {});
+  }
+
+  Future<bool> _onLiveScanAdd(StockItem stockItem, ScannedItem scannedItem) async {
+    try {
+      final scanKey = stockItem.scanCode ?? '';
+      if (scanKey.isEmpty) return false;
+
+      // Aggregate against current section state: scanning the same product
+      // again should add to its quantity, not replace it.
+      final existing = currentStock[scanKey];
+      final mergedQty = (existing?.quantity ?? 0) + stockItem.quantity;
+
+      final mergedStock = StockItem(
+        scanCode: stockItem.scanCode,
+        code: stockItem.code,
+        name: stockItem.name,
+        department: stockItem.department,
+        rate: stockItem.rate,
+        quantity: mergedQty,
+      );
+      final mergedScanned = ScannedItem(
+        code: scannedItem.code,
+        department: scannedItem.department,
+        name: scannedItem.name,
+        qty: mergedQty.toString(),
+        rate: scannedItem.rate,
+        source: scannedItem.source,
+        scanCode: scannedItem.scanCode,
+      );
+
+      setState(() {
+        currentStock[scanKey] = mergedStock;
+        if (mergedStock.department.isNotEmpty &&
+            !departments.contains(mergedStock.department)) {
+          departments.add(mergedStock.department);
+        }
+      });
+
+      await _addToBufferAndSync(mergedScanned);
+      await saveStock();
+      return true;
+    } catch (_) {
+      return false;
     }
   }
 
@@ -2077,7 +2155,21 @@ class _StockManagementScreenState extends State<StockManagementScreen>
           uploadProgress = 0.5;
         });
 
-        var excel = Excel.decodeBytes(file.bytes!);
+        Excel excel;
+        try {
+          excel = Excel.decodeBytes(file.bytes!);
+        } catch (e, st) {
+          // The excel package can throw "Null check operator used on a null
+          // value" for files containing unsupported cell types (formulas,
+          // shared strings without sst, custom date formats) or for files
+          // that are corrupted/password-protected.
+          debugPrint('Excel.decodeBytes failed: $e\n$st');
+          throw Exception(
+            'Could not read this Excel file. It may be password-protected, '
+            'corrupted, or contain unsupported cell types (formulas, custom '
+            'formats). Try saving it again as .xlsx and re-upload.',
+          );
+        }
         
         setState(() {
           uploadProgress = 0.7;
@@ -2089,121 +2181,86 @@ class _StockManagementScreenState extends State<StockManagementScreen>
         
         int itemsProcessed = 0;
         int totalItems = 0;
-        
-        // Count total items first for accurate progress
+        int loadedCount = 0;
+        int skippedCount = 0;
+        int failedCount = 0;
+
+        // Resilient cell extractors. Any failure inside the excel package
+        // (e.g. unexpected CellValue subtype) returns a safe default instead
+        // of bubbling up and aborting the entire upload.
+        String _cellAsString(dynamic cell) {
+          try {
+            final cellValue = cell?.value;
+            if (cellValue == null) return '';
+            if (cellValue is TextCellValue) return cellValue.value.toString().trim();
+            if (cellValue is IntCellValue) return cellValue.value.toString().trim();
+            if (cellValue is DoubleCellValue) return cellValue.value.toString().trim();
+            return cellValue.toString().trim();
+          } catch (_) {
+            return '';
+          }
+        }
+
+        double _cellAsDouble(dynamic cell) {
+          try {
+            final cellValue = cell?.value;
+            if (cellValue == null) return 0.0;
+            if (cellValue is IntCellValue) return cellValue.value.toDouble();
+            if (cellValue is DoubleCellValue) return cellValue.value;
+            if (cellValue is TextCellValue) {
+              return double.tryParse(cellValue.value.toString().trim()) ?? 0.0;
+            }
+            return double.tryParse(cellValue.toString()) ?? 0.0;
+          } catch (_) {
+            return 0.0;
+          }
+        }
+
+        int _cellAsInt(dynamic cell) {
+          try {
+            final cellValue = cell?.value;
+            if (cellValue == null) return 0;
+            if (cellValue is IntCellValue) return cellValue.value;
+            if (cellValue is DoubleCellValue) return cellValue.value.toInt();
+            if (cellValue is TextCellValue) {
+              return int.tryParse(cellValue.value.toString().trim()) ?? 0;
+            }
+            return int.tryParse(cellValue.toString()) ?? 0;
+          } catch (_) {
+            return 0;
+          }
+        }
+
         for (var table in excel.tables.keys) {
           var sheet = excel.tables[table];
           if (sheet != null) {
-            totalItems += sheet.maxRows - 1; // Subtract header row
+            final rows = sheet.maxRows - 1;
+            if (rows > 0) totalItems += rows;
           }
         }
+        final totalItemsSafe = totalItems < 1 ? 1 : totalItems;
         
         for (var table in excel.tables.keys) {
           var sheet = excel.tables[table];
-          if (sheet != null && sheet.maxRows > 1) {
-            // Skip header row (index 0), start from index 1
-            for (int i = 1; i < sheet.maxRows; i++) {
-              var row = sheet.row(i);
-              
-              // Check if row has enough columns and data
-              if (row.length >= 6) {
-                // Excel structure: Scan Code, Item Description, Item Code, Department, Rate, Qty
-                final scanCodeCell = row[0];
-                final itemDescriptionCell = row[1];
-                final itemCodeCell = row[2];
-                final departmentCell = row[3];
-                final priceGroupCell = row[4];
-                final quantityCell = row[5];
-                
-                // Extract values with null safety and proper type handling
-                String scanCode = '';
-                String itemDescription = '';
-                String itemCode = '';
-                String department = '';
-                
-                // Safe string extraction with type checking
-                if (scanCodeCell?.value != null) {
-                  final value = scanCodeCell!.value;
-                  if (value is TextCellValue) {
-                    scanCode = value.value.toString().trim();
-                  } else if (value is IntCellValue || value is DoubleCellValue) {
-                    scanCode = value.toString().trim();
-                  } else {
-                    scanCode = value.toString().trim();
-                  }
-                }
-                
-                if (itemDescriptionCell?.value != null) {
-                  final value = itemDescriptionCell!.value;
-                  if (value is TextCellValue) {
-                    itemDescription = value.value.toString().trim();
-                  } else if (value is IntCellValue || value is DoubleCellValue) {
-                    itemDescription = value.toString().trim();
-                  } else {
-                    itemDescription = value.toString().trim();
-                  }
-                }
-                
-                if (itemCodeCell?.value != null) {
-                  final value = itemCodeCell!.value;
-                  if (value is TextCellValue) {
-                    itemCode = value.value.toString().trim();
-                  } else if (value is IntCellValue || value is DoubleCellValue) {
-                    itemCode = value.toString().trim();
-                  } else {
-                    itemCode = value.toString().trim();
-                  }
-                }
-                
-                if (departmentCell?.value != null) {
-                  final value = departmentCell!.value;
-                  if (value is TextCellValue) {
-                    department = value.value.toString().trim();
-                  } else if (value is IntCellValue || value is DoubleCellValue) {
-                    department = value.toString().trim();
-                  } else {
-                    department = value.toString().trim();
-                  }
-                }
-                
-                // Handle numeric values more carefully
-                double priceGroup = 0.0;
-                int quantity = 0;
-                
-                // Handle Rate conversion
-                if (priceGroupCell?.value != null) {
-                  final priceValue = priceGroupCell!.value;
-                  if (priceValue is IntCellValue) {
-                    priceGroup = priceValue.value.toDouble();
-                  } else if (priceValue is DoubleCellValue) {
-                    priceGroup = priceValue.value;
-                  } else if (priceValue is TextCellValue) {
-                    priceGroup = double.tryParse(priceValue.value.toString()) ?? 0.0;
-                  } else {
-                    // Fallback for any other type
-                    priceGroup = double.tryParse(priceValue.toString()) ?? 0.0;
-                  }
-                }
-                
-                // Handle quantity conversion
-                if (quantityCell?.value != null) {
-                  final qtyValue = quantityCell!.value;
-                  if (qtyValue is IntCellValue) {
-                    quantity = qtyValue.value;
-                  } else if (qtyValue is DoubleCellValue) {
-                    quantity = qtyValue.value.toInt();
-                  } else if (qtyValue is TextCellValue) {
-                    quantity = int.tryParse(qtyValue.value.toString()) ?? 0;
-                  } else {
-                    // Fallback for any other type
-                    quantity = int.tryParse(qtyValue.toString()) ?? 0;
-                  }
-                }
-                
-                // Only process items that belong to the allocated section and have valid data
+          if (sheet == null || sheet.maxRows <= 1) continue;
+          // Skip header row (index 0), start from index 1
+          for (int i = 1; i < sheet.maxRows; i++) {
+            try {
+              final row = sheet.row(i);
+
+              if (row.length < 6) {
+                skippedCount++;
+              } else {
+                // Excel structure: Scan Code, Item Description, Item Code,
+                // Department, Rate, Qty
+                final scanCode = scanCodeFromExcelCell(row[0]);
+                final itemDescription = _cellAsString(row[1]);
+                final itemCode = _cellAsString(row[2]);
+                final department = _cellAsString(row[3]);
+                final priceGroup = _cellAsDouble(row[4]);
+                final quantity = _cellAsInt(row[5]);
+
                 if (scanCode.isNotEmpty && itemCode.isNotEmpty) {
-                  
-                  // Store with scanCode as key
                   previousStock[scanCode] = StockItem(
                     scanCode: scanCode,
                     code: itemCode,
@@ -2212,39 +2269,58 @@ class _StockManagementScreenState extends State<StockManagementScreen>
                     rate: priceGroup,
                     quantity: quantity,
                   );
-                  
-                  if (!departments.contains(department)) {
+                  if (department.isNotEmpty &&
+                      !departments.contains(department)) {
                     departments.add(department);
                   }
+                  loadedCount++;
+                } else {
+                  skippedCount++;
                 }
               }
-              
-              itemsProcessed++;
-              // Update progress during processing
-              if (itemsProcessed % 10 == 0) {
-                setState(() {
-                  uploadProgress = 0.7 + (0.2 * (itemsProcessed / totalItems));
-                });
-                // Allow UI to update
-                await Future.delayed(Duration(milliseconds: 1));
-              }
+            } catch (e, st) {
+              failedCount++;
+              debugPrint('Row $i parse failed in "$table": $e\n$st');
+            }
+
+            itemsProcessed++;
+            if (itemsProcessed % 25 == 0) {
+              setState(() {
+                uploadProgress =
+                    0.7 + (0.2 * (itemsProcessed / totalItemsSafe));
+              });
+              await Future.delayed(const Duration(milliseconds: 1));
             }
           }
         }
         
+        if (loadedCount == 0) {
+          // Nothing valid was loaded -> surface a clear error and stay on
+          // the upload step so the user can pick a different file.
+          throw Exception(
+            'No valid items found. Expected 6 columns: Scan Code, '
+            'Item Description, Item Code, Department, Rate, Qty. '
+            '($skippedCount skipped, $failedCount errors)',
+          );
+        }
+
         setState(() {
           uploadProgress = 1.0;
           uploadedFileName = file.name;
           currentStep = 1;
         });
         
-        // Show success message
         if (mounted) {
+          final hasIssues = skippedCount > 0 || failedCount > 0;
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Excel file uploaded successfully! ${previousStock.length} items loaded.'),
+              content: Text(
+                hasIssues
+                    ? '$loadedCount items loaded ($skippedCount skipped, $failedCount errors)'
+                    : 'Excel uploaded! $loadedCount items loaded.',
+              ),
               backgroundColor: Colors.green,
-              duration: Duration(seconds: 3),
+              duration: const Duration(seconds: 3),
             ),
           );
         }
@@ -2252,13 +2328,14 @@ class _StockManagementScreenState extends State<StockManagementScreen>
       } else {
         throw Exception('No file selected or file is empty.');
       }
-    } catch (e) {
+    } catch (e, st) {
+      debugPrint('uploadExcel failed: $e\n$st');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Error uploading file: ${e.toString()}'),
             backgroundColor: Colors.red,
-            duration: Duration(seconds: 5),
+            duration: const Duration(seconds: 5),
           ),
         );
       }
@@ -2273,16 +2350,16 @@ class _StockManagementScreenState extends State<StockManagementScreen>
   }
   
 void handleBarcodeScan(String barcode) {
-  //print('Scanned barcode: $barcode'); // Debug print
-  
-  // Stop scanning immediately after successful scan
+  final normalized = normalizeScanCode(barcode);
+
   setState(() {
-    scanCodeController.text = barcode;
+    scanCodeController.text = normalized;
     isScanning = false;
   });
-  
-  if (previousStock.containsKey(barcode)) {
-    _fillFormFromStock(barcode);
+
+  final found = lookupStockByScanCode(previousStock, normalized);
+  if (found != null) {
+    _fillFormFromStock(found.scanCode ?? normalized);
   } else {
     setState(() {
       codeController.clear();
@@ -2442,32 +2519,31 @@ void handleBarcodeScan(String barcode) {
   }
 
   void _fillFormFromStock(String scanCode) {
-    if (previousStock.containsKey(scanCode)) {
-      final foundItem = previousStock[scanCode]!;
-      
-      setState(() {
-        scanCodeController.text = foundItem.scanCode ?? scanCode;
-        codeController.text = foundItem.code;
-        nameController.text = foundItem.name;
-        departmentController.text = foundItem.department;
-        rateController.text = foundItem.rate.toString();
-        quantityController.clear(); // Clear quantity for new entry
-      });
-      
-      // Focus on quantity field after autofill
-      Future.delayed(Duration(milliseconds: 100), () {
-        quantityFocusNode.requestFocus();
-      });
-      
-      // Show success feedback
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Item loaded: ${foundItem.name} (Code: ${foundItem.code})'),
-          duration: Duration(seconds: 2),
-          backgroundColor: Colors.green,
-        ),
-      );
-    }
+    final foundItem = lookupStockByScanCode(previousStock, scanCode);
+    if (foundItem == null) return;
+
+    setState(() {
+      scanCodeController.text = foundItem.scanCode ?? scanCode;
+      codeController.text = foundItem.code;
+      nameController.text = foundItem.name;
+      departmentController.text = foundItem.department;
+      rateController.text = foundItem.rate.toString();
+      quantityController.clear(); // Clear quantity for new entry
+    });
+
+    // Focus on quantity field after autofill
+    Future.delayed(Duration(milliseconds: 100), () {
+      quantityFocusNode.requestFocus();
+    });
+
+    // Show success feedback
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Item loaded: ${foundItem.name} (Code: ${foundItem.code})'),
+        duration: Duration(seconds: 2),
+        backgroundColor: Colors.green,
+      ),
+    );
   }
   
   Widget _buildStockEntryForm() {
@@ -2482,117 +2558,159 @@ void handleBarcodeScan(String barcode) {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(
-                        'Barcode Scanner',
-                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  Text(
+                    'Barcode Scanner',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  SizedBox(height: 12),
+                  // Phase 1: Live Scan entry point. Real-time always-on
+                  // scanner with auto-fill from previousStock and an inline
+                  // counter + ADD that pushes through the existing buffer/sync.
+                  SizedBox(
+                    width: double.infinity,
+                    height: 52,
+                    child: ElevatedButton.icon(
+                      onPressed: _openLiveScan,
+                      icon: const Icon(FontAwesomeIcons.bolt, size: 18),
+                      label: const Text(
+                        'Live Scan',
+                        style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, letterSpacing: 0.3),
                       ),
-                      // IconButton(
-                      //   onPressed: () => setState(() => isScanning = !isScanning),
-                      //   icon: Icon(
-                      //     isScanning ? FontAwesomeIcons.stop : FontAwesomeIcons.barcode,
-                      //     color: Colors.deepPurple,
-                      //   ),
-                      // ),
-                      IconButton(
-                        onPressed: () {
-                          setState(() {
-                            isScanning = !isScanning;
-                          });
-                          // If we're starting to scan, ensure the scanner is fresh
-                          if (isScanning) {
-                            // Restart the scanner controller
-                            scannerController.dispose();
-                            scannerController = MobileScannerController();
-                          }
-                        },
-                        icon: Icon(
-                          isScanning ? FontAwesomeIcons.stop : FontAwesomeIcons.barcode,
-                          color: const Color.fromARGB(255, 3, 25, 55),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color.fromARGB(255, 3, 25, 55),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        elevation: 2,
+                      ),
+                    ),
+                  ),
+                  SizedBox(height: 6),
+                  Text(
+                    'Camera stays live • barcodes & labels • count and add',
+                    style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                  ),
+                  // Phase 3: Classic MobileScanner is secondary (barcode-only inline view).
+                  Theme(
+                    data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+                    child: ExpansionTile(
+                      tilePadding: EdgeInsets.zero,
+                      childrenPadding: const EdgeInsets.only(top: 8),
+                      initiallyExpanded: false,
+                      title: Text(
+                        'Classic inline scanner',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.grey.shade800,
                         ),
                       ),
-                    ],
-                  ),
-                  if (isScanning) ...[
-                    SizedBox(height: 16),
-                    Container(
-                      height: 250, // Increased height
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: const Color.fromARGB(255, 3, 25, 55)),
+                      subtitle: Text(
+                        'Optional — barcode only on this screen. Prefer Live Scan for labels.',
+                        style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
                       ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: Stack(
+                      onExpansionChanged: (expanded) {
+                        if (!expanded && isScanning) {
+                          setState(() => isScanning = false);
+                        }
+                      },
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.end,
                           children: [
-                            MobileScanner(
-                              controller: scannerController,
-                              onDetect: (capture) {
-                                final List<Barcode> barcodes = capture.barcodes;
-                                for (final barcode in barcodes) {
-                                  if (barcode.rawValue != null && barcode.rawValue!.isNotEmpty) {
-                                    //print('Scanned barcode: ${barcode.rawValue}'); // Debug print
-                                    handleBarcodeScan(barcode.rawValue!);
-                                    break;
-                                  }
+                            IconButton(
+                              onPressed: () {
+                                setState(() {
+                                  isScanning = !isScanning;
+                                });
+                                if (isScanning) {
+                                  scannerController.dispose();
+                                  scannerController = MobileScannerController();
                                 }
                               },
-                            ),
-                            // Overlay with scanning guidelines
-                            Center(
-                              child: Container(
-                                width: 200,
-                                height: 100,
-                                decoration: BoxDecoration(
-                                  border: Border.all(color: Colors.red, width: 2),
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
+                              icon: Icon(
+                                isScanning ? FontAwesomeIcons.stop : FontAwesomeIcons.barcode,
+                                color: const Color.fromARGB(255, 3, 25, 55),
                               ),
                             ),
-                            // Controls overlay
-                            Positioned(
-                              bottom: 10,
-                              left: 10,
-                              right: 10,
-                              child: Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                          ],
+                        ),
+                        if (isScanning) ...[
+                          Container(
+                            height: 250,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: const Color.fromARGB(255, 3, 25, 55)),
+                            ),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: Stack(
                                 children: [
-                                  Container(
-                                    decoration: BoxDecoration(
-                                      color: Colors.black54,
-                                      borderRadius: BorderRadius.circular(20),
-                                    ),
-                                    child: IconButton(
-                                      icon: Icon(Icons.flash_on, color: Colors.white),
-                                      onPressed: () => scannerController.toggleTorch(),
+                                  MobileScanner(
+                                    controller: scannerController,
+                                    onDetect: (capture) {
+                                      final List<Barcode> barcodes = capture.barcodes;
+                                      for (final barcode in barcodes) {
+                                        if (barcode.rawValue != null && barcode.rawValue!.isNotEmpty) {
+                                          handleBarcodeScan(barcode.rawValue!);
+                                          break;
+                                        }
+                                      }
+                                    },
+                                  ),
+                                  Center(
+                                    child: Container(
+                                      width: 200,
+                                      height: 100,
+                                      decoration: BoxDecoration(
+                                        border: Border.all(color: Colors.red, width: 2),
+                                        borderRadius: BorderRadius.circular(8),
+                                      ),
                                     ),
                                   ),
-                                  Container(
-                                    decoration: BoxDecoration(
-                                      color: Colors.black54,
-                                      borderRadius: BorderRadius.circular(20),
-                                    ),
-                                    child: IconButton(
-                                      icon: Icon(Icons.flip_camera_ios, color: Colors.white),
-                                      onPressed: () => scannerController.switchCamera(),
+                                  Positioned(
+                                    bottom: 10,
+                                    left: 10,
+                                    right: 10,
+                                    child: Row(
+                                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                                      children: [
+                                        Container(
+                                          decoration: BoxDecoration(
+                                            color: Colors.black54,
+                                            borderRadius: BorderRadius.circular(20),
+                                          ),
+                                          child: IconButton(
+                                            icon: Icon(Icons.flash_on, color: Colors.white),
+                                            onPressed: () => scannerController.toggleTorch(),
+                                          ),
+                                        ),
+                                        Container(
+                                          decoration: BoxDecoration(
+                                            color: Colors.black54,
+                                            borderRadius: BorderRadius.circular(20),
+                                          ),
+                                          child: IconButton(
+                                            icon: Icon(Icons.flip_camera_ios, color: Colors.white),
+                                            onPressed: () => scannerController.switchCamera(),
+                                          ),
+                                        ),
+                                      ],
                                     ),
                                   ),
                                 ],
                               ),
                             ),
-                          ],
-                        ),
-                      ),
+                          ),
+                          SizedBox(height: 8),
+                          Text(
+                            'Position the barcode within the red frame',
+                            style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                            textAlign: TextAlign.center,
+                          ),
+                        ],
+                      ],
                     ),
-                    SizedBox(height: 8),
-                    Text(
-                      'Position the barcode within the red frame',
-                      style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
+                  ),
                 ],
               ),
             ),
@@ -2925,7 +3043,7 @@ void handleBarcodeScan(String barcode) {
   }
 
   bool _isCodeRecognized(String inputCode) {
-    return previousStock.containsKey(inputCode);
+    return lookupStockByScanCode(previousStock, inputCode) != null;
   }
   
   Future<void> generatePDFReport() async {
