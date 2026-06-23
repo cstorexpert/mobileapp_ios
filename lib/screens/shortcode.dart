@@ -31,9 +31,31 @@ class ShortCode {
       id: json['id']?.toString(),
       shortcode: json['shortcode'] ?? '',
       longcode: json['longcode'] ?? '',
-      createdAt: json['createdAt'] != null ? DateTime.parse(json['createdAt']) : null,
-      updatedAt: json['updatedAt'] != null ? DateTime.parse(json['updatedAt']) : null,
+      createdAt: _parseDateTime(json['createdAt']),
+      updatedAt: _parseDateTime(json['updatedAt']),
     );
+  }
+
+  static DateTime? _parseDateTime(dynamic value) {
+    if (value == null) return null;
+
+    if (value is DateTime) return value;
+
+    if (value is String) {
+      return DateTime.tryParse(value);
+    }
+
+    if (value is Map<String, dynamic>) {
+      final seconds = value['_seconds'];
+      final nanoseconds = value['_nanoseconds'];
+      if (seconds is num) {
+        final millis = (seconds * 1000).toInt();
+        final nanoPart = nanoseconds is num ? (nanoseconds / 1000000).round() : 0;
+        return DateTime.fromMillisecondsSinceEpoch(millis + nanoPart, isUtc: true).toLocal();
+      }
+    }
+
+    return null;
   }
 
   Map<String, dynamic> toJson() {

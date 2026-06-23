@@ -12,6 +12,7 @@ import 'package:printing/printing.dart';
 import 'package:excel/excel.dart' hide Border;
 import 'dart:convert';
 import 'dart:math' as math;
+import 'package:countx/utils/scan_code_utils.dart';
 
 import 'package:countx/drawer.dart';
 
@@ -198,6 +199,37 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
         int itemsProcessed = 0;
         int totalItems = 0;
         
+        String cellAsString(dynamic cell) {
+          final cellValue = cell?.value;
+          if (cellValue == null) return '';
+          if (cellValue is TextCellValue) return cellValue.value.toString().trim();
+          if (cellValue is IntCellValue) return cellValue.value.toString().trim();
+          if (cellValue is DoubleCellValue) return cellValue.value.toString().trim();
+          return cellValue.toString().trim();
+        }
+
+        double cellAsDouble(dynamic cell) {
+          final cellValue = cell?.value;
+          if (cellValue == null) return 0.0;
+          if (cellValue is IntCellValue) return cellValue.value.toDouble();
+          if (cellValue is DoubleCellValue) return cellValue.value;
+          if (cellValue is TextCellValue) {
+            return double.tryParse(cellValue.value.toString().trim()) ?? 0.0;
+          }
+          return double.tryParse(cellValue.toString()) ?? 0.0;
+        }
+
+        int cellAsInt(dynamic cell) {
+          final cellValue = cell?.value;
+          if (cellValue == null) return 0;
+          if (cellValue is IntCellValue) return cellValue.value;
+          if (cellValue is DoubleCellValue) return cellValue.value.toInt();
+          if (cellValue is TextCellValue) {
+            return int.tryParse(cellValue.value.toString().trim()) ?? 0;
+          }
+          return int.tryParse(cellValue.toString()) ?? 0;
+        }
+
         // Count total items first for accurate progress
         for (var table in excel.tables.keys) {
           var sheet = excel.tables[table];
@@ -205,6 +237,7 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
             totalItems += sheet.maxRows - 1; // Subtract header row
           }
         }
+        final totalItemsSafe = totalItems < 1 ? 1 : totalItems;
         
         for (var table in excel.tables.keys) {
           var sheet = excel.tables[table];
@@ -222,91 +255,12 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
                 final departmentCell = row[3];
                 final priceGroupCell = row[4];
                 final quantityCell = row[5];
-                
-                // Extract values with null safety and proper type handling
-                String scanCode = '';
-                String itemDescription = '';
-                String itemCode = '';
-                String department = '';
-                
-                // Safe string extraction with type checking
-                if (scanCodeCell?.value != null) {
-                  final value = scanCodeCell!.value;
-                  if (value is TextCellValue) {
-                    scanCode = value.value.toString().trim();
-                  } else if (value is IntCellValue || value is DoubleCellValue) {
-                    scanCode = value.toString().trim();
-                  } else {
-                    scanCode = value.toString().trim();
-                  }
-                }
-                
-                if (itemDescriptionCell?.value != null) {
-                  final value = itemDescriptionCell!.value;
-                  if (value is TextCellValue) {
-                    itemDescription = value.value.toString().trim();
-                  } else if (value is IntCellValue || value is DoubleCellValue) {
-                    itemDescription = value.toString().trim();
-                  } else {
-                    itemDescription = value.toString().trim();
-                  }
-                }
-                
-                if (itemCodeCell?.value != null) {
-                  final value = itemCodeCell!.value;
-                  if (value is TextCellValue) {
-                    itemCode = value.value.toString().trim();
-                  } else if (value is IntCellValue || value is DoubleCellValue) {
-                    itemCode = value.toString().trim();
-                  } else {
-                    itemCode = value.toString().trim();
-                  }
-                }
-                
-                if (departmentCell?.value != null) {
-                  final value = departmentCell!.value;
-                  if (value is TextCellValue) {
-                    department = value.value.toString().trim();
-                  } else if (value is IntCellValue || value is DoubleCellValue) {
-                    department = value.toString().trim();
-                  } else {
-                    department = value.toString().trim();
-                  }
-                }
-                
-                // Handle numeric values more carefully
-                double priceGroup = 0.0;
-                int quantity = 0;
-                
-                // Handle price group conversion
-                if (priceGroupCell?.value != null) {
-                  final priceValue = priceGroupCell!.value;
-                  if (priceValue is IntCellValue) {
-                    priceGroup = priceValue.value.toDouble();
-                  } else if (priceValue is DoubleCellValue) {
-                    priceGroup = priceValue.value;
-                  } else if (priceValue is TextCellValue) {
-                    priceGroup = double.tryParse(priceValue.value.toString()) ?? 0.0;
-                  } else {
-                    // Fallback for any other type
-                    priceGroup = double.tryParse(priceValue.toString()) ?? 0.0;
-                  }
-                }
-                
-                // Handle quantity conversion
-                if (quantityCell?.value != null) {
-                  final qtyValue = quantityCell!.value;
-                  if (qtyValue is IntCellValue) {
-                    quantity = qtyValue.value;
-                  } else if (qtyValue is DoubleCellValue) {
-                    quantity = qtyValue.value.toInt();
-                  } else if (qtyValue is TextCellValue) {
-                    quantity = int.tryParse(qtyValue.value.toString()) ?? 0;
-                  } else {
-                    // Fallback for any other type
-                    quantity = int.tryParse(qtyValue.toString()) ?? 0;
-                  }
-                }
+                final scanCode = scanCodeFromExcelCell(scanCodeCell);
+                final itemDescription = cellAsString(itemDescriptionCell);
+                final itemCode = cellAsString(itemCodeCell);
+                final department = cellAsString(departmentCell);
+                final priceGroup = cellAsDouble(priceGroupCell);
+                final quantity = cellAsInt(quantityCell);
                 
                 // Only process items that belong to the allocated section and have valid data
                 if (scanCode.isNotEmpty && 
@@ -333,7 +287,7 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
               // Update progress during processing
               if (itemsProcessed % 10 == 0) {
                 setState(() {
-                  uploadProgress = 0.7 + (0.2 * (itemsProcessed / totalItems));
+                  uploadProgress = 0.7 + (0.2 * (itemsProcessed / totalItemsSafe));
                 });
                 // Allow UI to update
                 await Future.delayed(Duration(milliseconds: 1));
@@ -384,15 +338,16 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
   
 void handleBarcodeScan(String barcode) {
   print('Scanned barcode: $barcode'); // Debug print
-  
-  // Stop scanning immediately after successful scan
+  final normalized = normalizeScanCode(barcode);
+
   setState(() {
-    scanCodeController.text = barcode;
+    scanCodeController.text = normalized;
     isScanning = false;
   });
-  
-  if (previousStock.containsKey(barcode)) {
-    _fillFormFromStock(barcode);
+
+  final found = lookupStockByScanCode(previousStock, normalized);
+  if (found != null) {
+    _fillFormFromStock(found.scanCode ?? normalized);
   } else {
     setState(() {
       codeController.clear();
@@ -501,32 +456,29 @@ void handleBarcodeScan(String barcode) {
   }
 
   void _fillFormFromStock(String scanCode) {
-    if (previousStock.containsKey(scanCode)) {
-      final foundItem = previousStock[scanCode]!;
-      
-      setState(() {
-        scanCodeController.text = foundItem.scanCode ?? scanCode;
-        codeController.text = foundItem.code;
-        nameController.text = foundItem.name;
-        departmentController.text = foundItem.department;
-        rateController.text = foundItem.rate.toString();
-        quantityController.clear(); // Clear quantity for new entry
-      });
-      
-      // Focus on quantity field after autofill
-      Future.delayed(Duration(milliseconds: 100), () {
-        quantityFocusNode.requestFocus();
-      });
-      
-      // Show success feedback
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Item loaded: ${foundItem.name} (Code: ${foundItem.code})'),
-          duration: Duration(seconds: 2),
-          backgroundColor: Colors.green,
-        ),
-      );
-    }
+    final foundItem = lookupStockByScanCode(previousStock, scanCode);
+    if (foundItem == null) return;
+
+    setState(() {
+      scanCodeController.text = foundItem.scanCode ?? scanCode;
+      codeController.text = foundItem.code;
+      nameController.text = foundItem.name;
+      departmentController.text = foundItem.department;
+      rateController.text = foundItem.rate.toString();
+      quantityController.clear(); // Clear quantity for new entry
+    });
+
+    Future.delayed(Duration(milliseconds: 100), () {
+      quantityFocusNode.requestFocus();
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Item loaded: ${foundItem.name} (Code: ${foundItem.code})'),
+        duration: Duration(seconds: 2),
+        backgroundColor: Colors.green,
+      ),
+    );
   }
   
   Widget _buildStockEntryForm() {
@@ -959,7 +911,7 @@ void handleBarcodeScan(String barcode) {
   }
 
   bool _isCodeRecognized(String inputCode) {
-    return previousStock.containsKey(inputCode);
+    return lookupStockByScanCode(previousStock, inputCode) != null;
   }
   
   Future<void> generatePDFReport() async {
