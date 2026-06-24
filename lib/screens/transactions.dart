@@ -1621,7 +1621,6 @@ class _StockManagementScreenState extends State<StockManagementScreen>
   
   // Controllers
   final TextEditingController scanCodeController = TextEditingController();
-  final TextEditingController codeController = TextEditingController();
   final TextEditingController nameController = TextEditingController();
   final TextEditingController departmentController = TextEditingController();
   final TextEditingController rateController = TextEditingController();
@@ -1641,7 +1640,6 @@ class _StockManagementScreenState extends State<StockManagementScreen>
   MobileScannerController scannerController = MobileScannerController();
 
   final FocusNode scanCodeFocusNode = FocusNode();
-  final FocusNode codeFocusNode = FocusNode();
   final FocusNode nameFocusNode = FocusNode();
   final FocusNode departmentFocusNode = FocusNode();
   final FocusNode rateFocusNode = FocusNode();
@@ -1661,14 +1659,12 @@ class _StockManagementScreenState extends State<StockManagementScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     scanCodeController.dispose();
-    codeController.dispose();
     nameController.dispose();
     departmentController.dispose();
     rateController.dispose();
     quantityController.dispose();
     scannerController.dispose();
     scanCodeFocusNode.dispose();
-    codeFocusNode.dispose();
     nameFocusNode.dispose();
     departmentFocusNode.dispose();
     rateFocusNode.dispose();
@@ -1939,8 +1935,7 @@ class _StockManagementScreenState extends State<StockManagementScreen>
       return;
     }
     
-    if (codeController.text.isEmpty ||
-        nameController.text.isEmpty ||
+    if (nameController.text.isEmpty ||
         departmentController.text.isEmpty ||
         rateController.text.isEmpty ||
         quantityController.text.isEmpty) {
@@ -1959,7 +1954,7 @@ class _StockManagementScreenState extends State<StockManagementScreen>
       // Create stock item for local tracking
       final stockItem = StockItem(
         scanCode: scanCodeController.text,
-        code: codeController.text,
+        code: scanCodeController.text,
         name: nameController.text,
         department: departmentController.text,
         rate: double.parse(rateController.text),
@@ -1968,7 +1963,7 @@ class _StockManagementScreenState extends State<StockManagementScreen>
       
       // Create scanned item for API
       final scannedItem = ScannedItem(
-        code: codeController.text,
+        code: scanCodeController.text,
         department: departmentController.text,
         name: nameController.text,
         qty: quantityController.text,
@@ -2089,9 +2084,12 @@ class _StockManagementScreenState extends State<StockManagementScreen>
   // }
 
   void _onScanCodeChanged() {
-    // Only check for recognition, don't auto-fill
-    // Auto-fill will happen on field submission instead
-    setState(() {}); // Just trigger rebuild to show/hide check icon
+    final input = scanCodeController.text.trim();
+    if (input.isNotEmpty && _isCodeRecognized(input)) {
+      _fillFormFromStock(input);
+    } else {
+      setState(() {});
+    }
   }
   
   Future<void> loadSavedStock() async {
@@ -2178,6 +2176,7 @@ class _StockManagementScreenState extends State<StockManagementScreen>
         // Clear previous stock before loading new data
         previousStock.clear();
         departments.clear();
+        currentStock.clear();
         
         int itemsProcessed = 0;
         int totalItems = 0;
@@ -2243,40 +2242,36 @@ class _StockManagementScreenState extends State<StockManagementScreen>
         for (var table in excel.tables.keys) {
           var sheet = excel.tables[table];
           if (sheet == null || sheet.maxRows <= 1) continue;
-          // Skip header row (index 0), start from index 1
+
+          final headerRow = sheet.row(0);
+          final sampleRow =
+              sheet.maxRows > 1 ? sheet.row(1) : null;
+          final cols = resolvePriceBookColumns(
+            headerRow,
+            sampleDataRow: sampleRow,
+          );
+
           for (int i = 1; i < sheet.maxRows; i++) {
             try {
               final row = sheet.row(i);
+              final parsed = parsePriceBookRow(row, cols);
 
-              if (row.length < 6) {
+              if (parsed == null) {
                 skippedCount++;
               } else {
-                // Excel structure: Scan Code, Item Description, Item Code,
-                // Department, Rate, Qty
-                final scanCode = scanCodeFromExcelCell(row[0]);
-                final itemDescription = _cellAsString(row[1]);
-                final itemCode = _cellAsString(row[2]);
-                final department = _cellAsString(row[3]);
-                final priceGroup = _cellAsDouble(row[4]);
-                final quantity = _cellAsInt(row[5]);
-
-                if (scanCode.isNotEmpty && itemCode.isNotEmpty) {
-                  previousStock[scanCode] = StockItem(
-                    scanCode: scanCode,
-                    code: itemCode,
-                    name: itemDescription,
-                    department: department,
-                    rate: priceGroup,
-                    quantity: quantity,
-                  );
-                  if (department.isNotEmpty &&
-                      !departments.contains(department)) {
-                    departments.add(department);
-                  }
-                  loadedCount++;
-                } else {
-                  skippedCount++;
+                previousStock[parsed.scanCode] = StockItem(
+                  scanCode: parsed.scanCode,
+                  code: parsed.scanCode,
+                  name: parsed.name,
+                  department: parsed.department,
+                  rate: parsed.rate,
+                  quantity: parsed.quantity,
+                );
+                if (parsed.department.isNotEmpty &&
+                    !departments.contains(parsed.department)) {
+                  departments.add(parsed.department);
                 }
+                loadedCount++;
               }
             } catch (e, st) {
               failedCount++;
@@ -2298,8 +2293,8 @@ class _StockManagementScreenState extends State<StockManagementScreen>
           // Nothing valid was loaded -> surface a clear error and stay on
           // the upload step so the user can pick a different file.
           throw Exception(
-            'No valid items found. Expected 6 columns: Scan Code, '
-            'Item Description, Item Code, Department, Rate, Qty. '
+            'No valid items found. Expected 5 columns: Scan Code, '
+            'Item Description, Department, Rate, Qty. '
             '($skippedCount skipped, $failedCount errors)',
           );
         }
@@ -2362,16 +2357,14 @@ void handleBarcodeScan(String barcode) {
     _fillFormFromStock(found.scanCode ?? normalized);
   } else {
     setState(() {
-      codeController.clear();
       nameController.clear();
       departmentController.clear();
       rateController.clear();
       quantityController.clear();
     });
     
-    // Focus on code field for new items
     Future.delayed(Duration(milliseconds: 100), () {
-      codeFocusNode.requestFocus();
+      nameFocusNode.requestFocus();
     });
     
     ScaffoldMessenger.of(context).showSnackBar(
@@ -2480,7 +2473,6 @@ void handleBarcodeScan(String barcode) {
   
   void clearForm() {
     scanCodeController.clear();
-    codeController.clear();
     nameController.clear();
     departmentController.clear();
     rateController.clear();
@@ -2524,7 +2516,6 @@ void handleBarcodeScan(String barcode) {
 
     setState(() {
       scanCodeController.text = foundItem.scanCode ?? scanCode;
-      codeController.text = foundItem.code;
       nameController.text = foundItem.name;
       departmentController.text = foundItem.department;
       rateController.text = foundItem.rate.toString();
@@ -2539,7 +2530,7 @@ void handleBarcodeScan(String barcode) {
     // Show success feedback
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text('Item loaded: ${foundItem.name} (Code: ${foundItem.code})'),
+        content: Text('Item loaded: ${foundItem.name}'),
         duration: Duration(seconds: 2),
         backgroundColor: Colors.green,
       ),
@@ -2547,6 +2538,8 @@ void handleBarcodeScan(String barcode) {
   }
   
   Widget _buildStockEntryForm() {
+    final sheetItemLocked = _isCodeRecognized(scanCodeController.text.trim());
+    final lockedFill = Colors.grey.shade100;
     return SingleChildScrollView(
       padding: EdgeInsets.all(16),
       child: Column(
@@ -2772,61 +2765,55 @@ void handleBarcodeScan(String barcode) {
                           _fillFormFromStock(value);  // ✅ Fill form when user submits (presses Enter)
                           quantityFocusNode.requestFocus();
                         } else {
-                          codeFocusNode.requestFocus();
+                          nameFocusNode.requestFocus();
                         }
                       }
                     },
                   ),
                   SizedBox(height: 12),
                   
-                  // Item Code field
-                  TextFormField(
-                    controller: codeController,
-                    focusNode: codeFocusNode,
-                    decoration: InputDecoration(
-                      labelText: 'Item Code',
-                      prefixIcon: Icon(FontAwesomeIcons.hashtag, size: 16),
-                      border: OutlineInputBorder(),
-                    ),
-                    onFieldSubmitted: (value) => nameFocusNode.requestFocus(),
-                  ),
-                  SizedBox(height: 12),
-                  
-                  // Name field
+                  // Item Description
                   TextFormField(
                     controller: nameController,
                     focusNode: nameFocusNode,
+                    readOnly: sheetItemLocked,
                     decoration: InputDecoration(
                       labelText: 'Item Description',
                       prefixIcon: Icon(FontAwesomeIcons.tag, size: 16),
                       border: OutlineInputBorder(),
+                      filled: sheetItemLocked,
+                      fillColor: sheetItemLocked ? lockedFill : null,
                     ),
                     onFieldSubmitted: (value) => departmentFocusNode.requestFocus(),
                   ),
                   SizedBox(height: 12),
                   
-                  // Department field
                   TextFormField(
                     controller: departmentController,
                     focusNode: departmentFocusNode,
+                    readOnly: sheetItemLocked,
                     decoration: InputDecoration(
                       labelText: 'Department',
                       prefixIcon: Icon(FontAwesomeIcons.building, size: 16),
                       border: OutlineInputBorder(),
+                      filled: sheetItemLocked,
+                      fillColor: sheetItemLocked ? lockedFill : null,
                     ),
                     onFieldSubmitted: (value) => rateFocusNode.requestFocus(),
                   ),
                   SizedBox(height: 12),
                   
-                  // Rate field
                   TextFormField(
                     controller: rateController,
                     focusNode: rateFocusNode,
+                    readOnly: sheetItemLocked,
                     keyboardType: TextInputType.number,
                     decoration: InputDecoration(
                       labelText: 'Rate',
                       prefixIcon: Icon(FontAwesomeIcons.dollarSign, size: 16),
                       border: OutlineInputBorder(),
+                      filled: sheetItemLocked,
+                      fillColor: sheetItemLocked ? lockedFill : null,
                     ),
                     onFieldSubmitted: (value) => quantityFocusNode.requestFocus(),
                   ),
@@ -2959,10 +2946,12 @@ void handleBarcodeScan(String barcode) {
                           return ListTile(
                             leading: CircleAvatar(
                               backgroundColor: const Color.fromARGB(255, 3, 25, 55),
-                              child: Text(item.code.isNotEmpty ? item.code[0] : 'X'),
+                              child: Text(item.name.isNotEmpty ? item.name[0] : 'X'),
                             ),
                             title: Text(item.name),
-                            subtitle: Text('Code: ${item.code} | Scan: ${item.scanCode}'),
+                            subtitle: Text(
+                              '${item.department.isNotEmpty ? item.department : '—'} • Scan: ${item.scanCode ?? ''}',
+                            ),
                             trailing: Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
@@ -3352,7 +3341,7 @@ void handleBarcodeScan(String barcode) {
     );
     
     sheet.cell(CellIndex.indexByString('A2')).value = TextCellValue('SECTION');
-    sheet.cell(CellIndex.indexByString('B2')).value = TextCellValue('CODE');
+    sheet.cell(CellIndex.indexByString('B2')).value = TextCellValue('SCAN CODE');
     sheet.cell(CellIndex.indexByString('C2')).value = TextCellValue('DEPARTMENT');
     sheet.cell(CellIndex.indexByString('D2')).value = TextCellValue('ITEM NAME');
     sheet.cell(CellIndex.indexByString('E2')).value = TextCellValue('RATE');
@@ -3365,7 +3354,7 @@ void handleBarcodeScan(String barcode) {
     
     // Set column widths
     sheet.setColumnWidth(0, 15); // Section
-    sheet.setColumnWidth(1, 18); // Code
+    sheet.setColumnWidth(1, 18); // Scan Code
     sheet.setColumnWidth(2, 18); // Department
     sheet.setColumnWidth(3, 40); // Item Name
     sheet.setColumnWidth(4, 12); // Rate
@@ -3383,7 +3372,7 @@ void handleBarcodeScan(String barcode) {
     int row = 3;
     for (var item in sortedStock) {
       sheet.cell(CellIndex.indexByString('A$row')).value = TextCellValue(widget.sectionName);
-      sheet.cell(CellIndex.indexByString('B$row')).value = TextCellValue(item.code);
+      sheet.cell(CellIndex.indexByString('B$row')).value = TextCellValue(item.scanCode ?? '');
       sheet.cell(CellIndex.indexByString('C$row')).value = TextCellValue(item.department);
       sheet.cell(CellIndex.indexByString('D$row')).value = TextCellValue(item.name);
       sheet.cell(CellIndex.indexByString('E$row')).value = DoubleCellValue(item.rate);
@@ -3416,7 +3405,7 @@ void handleBarcodeScan(String barcode) {
     );
     
     sheet.cell(CellIndex.indexByString('A3')).value = TextCellValue('DEPARTMENT');
-    sheet.cell(CellIndex.indexByString('B3')).value = TextCellValue('CODE');
+    sheet.cell(CellIndex.indexByString('B3')).value = TextCellValue('SCAN CODE');
     sheet.cell(CellIndex.indexByString('C3')).value = TextCellValue('TOTAL QTY');
     
     for (var col in ['A3', 'B3', 'C3']) {
@@ -3439,7 +3428,7 @@ void handleBarcodeScan(String barcode) {
     int row = 4;
     for (var item in sortedStock) {
       sheet.cell(CellIndex.indexByString('A$row')).value = TextCellValue(item.department);
-      sheet.cell(CellIndex.indexByString('B$row')).value = TextCellValue(item.code);
+      sheet.cell(CellIndex.indexByString('B$row')).value = TextCellValue(item.scanCode ?? '');
       sheet.cell(CellIndex.indexByString('C$row')).value = DoubleCellValue(item.quantity.toDouble());
       row++;
     }
@@ -3943,7 +3932,7 @@ void handleBarcodeScan(String barcode) {
             ),
             SizedBox(height: 16),
             Text(
-              'Upload an Excel file with columns:\nScan Code, Item Description, Item Code, Department, Rate, Qty',
+              'Upload an Excel file with columns:\nScan Code, Item Description, Department, Rate, Qty',
               textAlign: TextAlign.center,
               style: TextStyle(color: Colors.grey.shade600),
             ),
@@ -4203,7 +4192,7 @@ void handleBarcodeScan(String barcode) {
                         child: Icon(FontAwesomeIcons.plus, size: 12, color: Colors.green),
                       ),
                       title: Text(item.name),
-                      subtitle: Text('Code: ${item.code} | Scan: ${item.scanCode}'),
+                      subtitle: Text('${item.name} | Scan: ${item.scanCode}'),
                       trailing: Text(
                         'Qty: ${item.quantity}',
                         style: TextStyle(fontWeight: FontWeight.bold, color: Colors.green),
@@ -4244,7 +4233,7 @@ void handleBarcodeScan(String barcode) {
                           child: Icon(FontAwesomeIcons.arrowsRotate, size: 12, color: const Color.fromARGB(255, 3, 25, 55)),
                         ),
                         title: Text(entry.value.name),
-                        subtitle: Text('Code: ${entry.value.code} | Scan: ${entry.value.scanCode}'),
+                        subtitle: Text('${entry.value.name} | Scan: ${entry.value.scanCode}'),
                         trailing: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           crossAxisAlignment: CrossAxisAlignment.end,
@@ -4511,7 +4500,7 @@ class StockItem {
   
   factory StockItem.fromJson(Map<String, dynamic> json) => StockItem(
     scanCode: json['scanCode'],
-    code: json['code'],
+    code: json['scanCode']?.toString() ?? json['code']?.toString() ?? '',
     name: json['name'],
     department: json['department'],
     rate: json['rate'],
@@ -5058,7 +5047,7 @@ class TransactionReportScreen extends StatefulWidget {
 //     );
     
 //     sheet.cell(CellIndex.indexByString('A2')).value = TextCellValue('SECTION');
-//     sheet.cell(CellIndex.indexByString('B2')).value = TextCellValue('CODE');
+//     sheet.cell(CellIndex.indexByString('B2')).value = TextCellValue('SCAN CODE');
 //     sheet.cell(CellIndex.indexByString('C2')).value = TextCellValue('DEPARTMENT');
 //     sheet.cell(CellIndex.indexByString('D2')).value = TextCellValue('ITEM NAME');
 //     sheet.cell(CellIndex.indexByString('E2')).value = TextCellValue('RATE');
@@ -5157,7 +5146,7 @@ class TransactionReportScreen extends StatefulWidget {
 //     );
     
 //     sheet.cell(CellIndex.indexByString('A3')).value = TextCellValue('DEPARTMENT');
-//     sheet.cell(CellIndex.indexByString('B3')).value = TextCellValue('CODE');
+//     sheet.cell(CellIndex.indexByString('B3')).value = TextCellValue('SCAN CODE');
 //     sheet.cell(CellIndex.indexByString('C3')).value = TextCellValue('TOTAL QTY');
     
 //     for (var col in ['A3', 'B3', 'C3']) {
@@ -6330,7 +6319,7 @@ class _TransactionReportScreenState extends State<TransactionReportScreen> with 
     );
     
     sheet.cell(CellIndex.indexByString('A2')).value = TextCellValue('SECTION');
-    sheet.cell(CellIndex.indexByString('B2')).value = TextCellValue('CODE');
+    sheet.cell(CellIndex.indexByString('B2')).value = TextCellValue('SCAN CODE');
     sheet.cell(CellIndex.indexByString('C2')).value = TextCellValue('DEPARTMENT');
     sheet.cell(CellIndex.indexByString('D2')).value = TextCellValue('ITEM NAME');
     sheet.cell(CellIndex.indexByString('E2')).value = TextCellValue('RATE');
@@ -6366,7 +6355,6 @@ class _TransactionReportScreenState extends State<TransactionReportScreen> with 
             } else {
               consolidatedItems[scanCode] = {
                 'scanCode': scanCode,
-                'code': item['code'] ?? '',
                 'department': item['department'] ?? '',
                 'name': item['name'] ?? '',
                 'rate': (item['rate'] is num) ? (item['rate'] as num).toDouble() : 0.0,
@@ -6390,7 +6378,8 @@ class _TransactionReportScreenState extends State<TransactionReportScreen> with 
     for (var item in sortedItems) {
       String sections = (item['sections'] as List).join(', ');
       sheet.cell(CellIndex.indexByString('A$row')).value = TextCellValue(sections);
-      sheet.cell(CellIndex.indexByString('B$row')).value = TextCellValue(item['code']);
+      sheet.cell(CellIndex.indexByString('B$row')).value =
+          TextCellValue(item['scanCode']?.toString() ?? '');
       sheet.cell(CellIndex.indexByString('C$row')).value = TextCellValue(item['department']);
       sheet.cell(CellIndex.indexByString('D$row')).value = TextCellValue(item['name']);
       sheet.cell(CellIndex.indexByString('E$row')).value = DoubleCellValue(item['rate']);
@@ -6420,7 +6409,7 @@ class _TransactionReportScreenState extends State<TransactionReportScreen> with 
     );
     
     sheet.cell(CellIndex.indexByString('A3')).value = TextCellValue('DEPARTMENT');
-    sheet.cell(CellIndex.indexByString('B3')).value = TextCellValue('CODE');
+    sheet.cell(CellIndex.indexByString('B3')).value = TextCellValue('SCAN CODE');
     sheet.cell(CellIndex.indexByString('C3')).value = TextCellValue('TOTAL QTY');
     
     for (var col in ['A3', 'B3', 'C3']) {
@@ -6431,36 +6420,40 @@ class _TransactionReportScreenState extends State<TransactionReportScreen> with 
     sheet.setColumnWidth(1, 20);
     sheet.setColumnWidth(2, 15);
     
-    Map<String, Map<String, int>> departmentCodeMap = {};
+    Map<String, Map<String, int>> departmentScanMap = {};
     final scannedData = currentTransactionData!['scannedData'] ?? {};
     
     scannedData.forEach((sectionName, items) {
       if (items is List) {
         for (var item in items) {
           String dept = item['department'] ?? '';
-          String code = item['code'] ?? '';
+          String scanCode = item['scanCode']?.toString() ??
+              item['code']?.toString() ??
+              '';
           int qty = int.tryParse(item['qty']?.toString() ?? '0') ?? 0;
-          
-          if (!departmentCodeMap.containsKey(dept)) {
-            departmentCodeMap[dept] = {};
-          }
-          
-          departmentCodeMap[dept]![code] = (departmentCodeMap[dept]![code] ?? 0) + qty;
+
+          if (dept.isEmpty || scanCode.isEmpty) continue;
+
+          departmentScanMap.putIfAbsent(dept, () => {});
+          departmentScanMap[dept]![scanCode] =
+              (departmentScanMap[dept]![scanCode] ?? 0) + qty;
         }
       }
     });
     
     int row = 4;
-    var sortedDepts = departmentCodeMap.keys.toList()..sort();
-    
+    var sortedDepts = departmentScanMap.keys.toList()..sort();
+
     for (var dept in sortedDepts) {
-      var codes = departmentCodeMap[dept]!;
-      var sortedCodes = codes.keys.toList()..sort();
-      
-      for (var code in sortedCodes) {
+      var scans = departmentScanMap[dept]!;
+      var sortedScans = scans.keys.toList()..sort();
+
+      for (var scanCode in sortedScans) {
         sheet.cell(CellIndex.indexByString('A$row')).value = TextCellValue(dept);
-        sheet.cell(CellIndex.indexByString('B$row')).value = TextCellValue(code);
-        sheet.cell(CellIndex.indexByString('C$row')).value = IntCellValue(codes[code]!);
+        sheet.cell(CellIndex.indexByString('B$row')).value =
+            TextCellValue(scanCode);
+        sheet.cell(CellIndex.indexByString('C$row')).value =
+            IntCellValue(scans[scanCode]!);
         row++;
       }
     }

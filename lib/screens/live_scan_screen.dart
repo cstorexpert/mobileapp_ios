@@ -494,14 +494,14 @@ class _LiveScanScreenState extends State<LiveScanScreen>
 
     final stockItem = StockItem(
       scanCode: scanCode,
-      code: product.code,
+      code: scanCode,
       name: product.name,
       department: department,
       rate: product.rate,
       quantity: _manualCount,
     );
     final scannedItem = ScannedItem(
-      code: product.code,
+      code: scanCode,
       department: department,
       name: product.name,
       qty: _manualCount.toString(),
@@ -1189,7 +1189,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        '${p.department.isEmpty ? '—' : p.department}  •  Code ${p.code}',
+                        '${p.department.isEmpty ? '—' : p.department}  •  ${p.name}',
                         style: TextStyle(
                           fontSize: 13,
                           color: Colors.grey.shade700,

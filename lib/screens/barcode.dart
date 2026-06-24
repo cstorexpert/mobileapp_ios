@@ -66,7 +66,6 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
   
   // Controllers
   final TextEditingController scanCodeController = TextEditingController();
-  final TextEditingController codeController = TextEditingController();
   final TextEditingController nameController = TextEditingController();
   final TextEditingController departmentController = TextEditingController();
   final TextEditingController rateController = TextEditingController();
@@ -82,7 +81,6 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
   MobileScannerController scannerController = MobileScannerController();
 
   final FocusNode scanCodeFocusNode = FocusNode();
-  final FocusNode codeFocusNode = FocusNode();
   final FocusNode nameFocusNode = FocusNode();
   final FocusNode departmentFocusNode = FocusNode();
   final FocusNode rateFocusNode = FocusNode();
@@ -98,7 +96,6 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
   @override
   void dispose() {
     scanCodeController.dispose();
-    codeController.dispose();
     nameController.dispose();
     departmentController.dispose();
     rateController.dispose();
@@ -106,7 +103,6 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
     scannerController.dispose();
 
     scanCodeFocusNode.dispose();
-    codeFocusNode.dispose();
     nameFocusNode.dispose();
     departmentFocusNode.dispose();
     rateFocusNode.dispose();
@@ -117,11 +113,10 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
 
   void _onScanCodeChanged() {
     final inputCode = scanCodeController.text.trim();
-    if (inputCode.isNotEmpty) {
-      // Check if it matches any scan code
-      if (previousStock.containsKey(inputCode)) {
-        _fillFormFromStock(inputCode);
-      }
+    if (inputCode.isNotEmpty && _isCodeRecognized(inputCode)) {
+      _fillFormFromStock(inputCode);
+    } else {
+      setState(() {});
     }
   }
   
@@ -241,57 +236,43 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
         
         for (var table in excel.tables.keys) {
           var sheet = excel.tables[table];
-          if (sheet != null && sheet.maxRows > 1) {
-            // Skip header row (index 0), start from index 1
-            for (int i = 1; i < sheet.maxRows; i++) {
-              var row = sheet.row(i);
-              
-              // Check if row has enough columns and data
-              if (row.length >= 6) {
-                // Excel structure: Scan Code, Item Description, Item Code, Department, Price Group, Qty
-                final scanCodeCell = row[0];
-                final itemDescriptionCell = row[1];
-                final itemCodeCell = row[2];
-                final departmentCell = row[3];
-                final priceGroupCell = row[4];
-                final quantityCell = row[5];
-                final scanCode = scanCodeFromExcelCell(scanCodeCell);
-                final itemDescription = cellAsString(itemDescriptionCell);
-                final itemCode = cellAsString(itemCodeCell);
-                final department = cellAsString(departmentCell);
-                final priceGroup = cellAsDouble(priceGroupCell);
-                final quantity = cellAsInt(quantityCell);
-                
-                // Only process items that belong to the allocated section and have valid data
-                if (scanCode.isNotEmpty && 
-                    itemCode.isNotEmpty && 
-                    department.toLowerCase() == widget.allocatedSection.toLowerCase()) {
-                  
-                  // Store with scanCode as key
-                  previousStock[scanCode] = StockItem(
-                    scanCode: scanCode,
-                    code: itemCode,
-                    name: itemDescription,
-                    department: department,
-                    rate: priceGroup,
-                    quantity: quantity,
-                  );
-                  
-                  if (!departments.contains(department)) {
-                    departments.add(department);
-                  }
-                }
+          if (sheet == null || sheet.maxRows <= 1) continue;
+
+          final headerRow = sheet.row(0);
+          final sampleRow =
+              sheet.maxRows > 1 ? sheet.row(1) : null;
+          final cols = resolvePriceBookColumns(
+            headerRow,
+            sampleDataRow: sampleRow,
+          );
+
+          for (int i = 1; i < sheet.maxRows; i++) {
+            var row = sheet.row(i);
+            final parsed = parsePriceBookRow(row, cols);
+
+            if (parsed != null &&
+                parsed.department.toLowerCase() ==
+                    widget.allocatedSection.toLowerCase()) {
+              previousStock[parsed.scanCode] = StockItem(
+                scanCode: parsed.scanCode,
+                code: parsed.scanCode,
+                name: parsed.name,
+                department: parsed.department,
+                rate: parsed.rate,
+                quantity: parsed.quantity,
+              );
+
+              if (!departments.contains(parsed.department)) {
+                departments.add(parsed.department);
               }
-              
-              itemsProcessed++;
-              // Update progress during processing
-              if (itemsProcessed % 10 == 0) {
-                setState(() {
-                  uploadProgress = 0.7 + (0.2 * (itemsProcessed / totalItemsSafe));
-                });
-                // Allow UI to update
-                await Future.delayed(Duration(milliseconds: 1));
-              }
+            }
+
+            itemsProcessed++;
+            if (itemsProcessed % 10 == 0) {
+              setState(() {
+                uploadProgress = 0.7 + (0.2 * (itemsProcessed / totalItemsSafe));
+              });
+              await Future.delayed(Duration(milliseconds: 1));
             }
           }
         }
@@ -350,7 +331,6 @@ void handleBarcodeScan(String barcode) {
     _fillFormFromStock(found.scanCode ?? normalized);
   } else {
     setState(() {
-      codeController.clear();
       nameController.clear();
       departmentController.text = widget.allocatedSection;
       rateController.clear();
@@ -359,7 +339,7 @@ void handleBarcodeScan(String barcode) {
     
     // Focus on code field for new items
     Future.delayed(Duration(milliseconds: 100), () {
-      codeFocusNode.requestFocus();
+      nameFocusNode.requestFocus();
     });
     
     ScaffoldMessenger.of(context).showSnackBar(
@@ -373,7 +353,6 @@ void handleBarcodeScan(String barcode) {
   
   void addOrUpdateStock() {
     if (scanCodeController.text.isNotEmpty && 
-        codeController.text.isNotEmpty &&
         nameController.text.isNotEmpty &&
         departmentController.text.isNotEmpty &&
         rateController.text.isNotEmpty &&
@@ -381,7 +360,7 @@ void handleBarcodeScan(String barcode) {
       
       final item = StockItem(
         scanCode: scanCodeController.text,
-        code: codeController.text,
+        code: scanCodeController.text,
         name: nameController.text,
         department: departmentController.text,
         rate: double.parse(rateController.text),
@@ -417,7 +396,6 @@ void handleBarcodeScan(String barcode) {
   
   void clearForm() {
     scanCodeController.clear();
-    codeController.clear();
     nameController.clear();
     departmentController.text = widget.allocatedSection;
     rateController.clear();
@@ -461,7 +439,6 @@ void handleBarcodeScan(String barcode) {
 
     setState(() {
       scanCodeController.text = foundItem.scanCode ?? scanCode;
-      codeController.text = foundItem.code;
       nameController.text = foundItem.name;
       departmentController.text = foundItem.department;
       rateController.text = foundItem.rate.toString();
@@ -474,7 +451,7 @@ void handleBarcodeScan(String barcode) {
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text('Item loaded: ${foundItem.name} (Code: ${foundItem.code})'),
+        content: Text('Item loaded: ${foundItem.name}'),
         duration: Duration(seconds: 2),
         backgroundColor: Colors.green,
       ),
@@ -482,6 +459,8 @@ void handleBarcodeScan(String barcode) {
   }
   
   Widget _buildStockEntryForm() {
+    final sheetItemLocked = _isCodeRecognized(scanCodeController.text.trim());
+    final lockedFill = Colors.grey.shade100;
     return SingleChildScrollView(
       padding: EdgeInsets.all(16),
       child: Column(
@@ -642,61 +621,54 @@ void handleBarcodeScan(String barcode) {
                         if (_isCodeRecognized(value)) {
                           quantityFocusNode.requestFocus();
                         } else {
-                          codeFocusNode.requestFocus();
+                          nameFocusNode.requestFocus();
                         }
                       }
                     },
                   ),
                   SizedBox(height: 12),
                   
-                  // Item Code field
-                  TextFormField(
-                    controller: codeController,
-                    focusNode: codeFocusNode,
-                    decoration: InputDecoration(
-                      labelText: 'Item Code',
-                      prefixIcon: Icon(FontAwesomeIcons.hashtag, size: 16),
-                      border: OutlineInputBorder(),
-                    ),
-                    onFieldSubmitted: (value) => nameFocusNode.requestFocus(),
-                  ),
-                  SizedBox(height: 12),
-                  
-                  // Name field
                   TextFormField(
                     controller: nameController,
                     focusNode: nameFocusNode,
+                    readOnly: sheetItemLocked,
                     decoration: InputDecoration(
                       labelText: 'Item Description',
                       prefixIcon: Icon(FontAwesomeIcons.tag, size: 16),
                       border: OutlineInputBorder(),
+                      filled: sheetItemLocked,
+                      fillColor: sheetItemLocked ? lockedFill : null,
                     ),
                     onFieldSubmitted: (value) => departmentFocusNode.requestFocus(),
                   ),
                   SizedBox(height: 12),
                   
-                  // Department field
                   TextFormField(
                     controller: departmentController,
                     focusNode: departmentFocusNode,
+                    readOnly: sheetItemLocked,
                     decoration: InputDecoration(
                       labelText: 'Department',
                       prefixIcon: Icon(FontAwesomeIcons.building, size: 16),
                       border: OutlineInputBorder(),
+                      filled: sheetItemLocked,
+                      fillColor: sheetItemLocked ? lockedFill : null,
                     ),
                     onFieldSubmitted: (value) => rateFocusNode.requestFocus(),
                   ),
                   SizedBox(height: 12),
                   
-                  // Rate field
                   TextFormField(
                     controller: rateController,
                     focusNode: rateFocusNode,
+                    readOnly: sheetItemLocked,
                     keyboardType: TextInputType.number,
                     decoration: InputDecoration(
                       labelText: 'Price Group / Rate',
                       prefixIcon: Icon(FontAwesomeIcons.dollarSign, size: 16),
                       border: OutlineInputBorder(),
+                      filled: sheetItemLocked,
+                      fillColor: sheetItemLocked ? lockedFill : null,
                     ),
                     onFieldSubmitted: (value) => quantityFocusNode.requestFocus(),
                   ),
@@ -827,10 +799,12 @@ void handleBarcodeScan(String barcode) {
                           return ListTile(
                             leading: CircleAvatar(
                               backgroundColor: const Color.fromARGB(255, 3, 25, 55),
-                              child: Text(item.code.isNotEmpty ? item.code[0] : 'X'),
+                              child: Text(item.name.isNotEmpty ? item.name[0] : 'X'),
                             ),
                             title: Text(item.name),
-                            subtitle: Text('Code: ${item.code} | Scan: ${item.scanCode}'),
+                            subtitle: Text(
+                              '${item.department.isNotEmpty ? item.department : '—'} • Scan: ${item.scanCode ?? ''}',
+                            ),
                             trailing: Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
@@ -1200,7 +1174,7 @@ void handleBarcodeScan(String barcode) {
             ),
             SizedBox(height: 16),
             Text(
-              'Upload an Excel file with columns:\nScan Code, Item Description, Item Code, Department, Price Group, Qty',
+              'Upload an Excel file with columns:\nScan Code, Item Description, Department, Price Group, Qty',
               textAlign: TextAlign.center,
               style: TextStyle(color: Colors.grey.shade600),
             ),
@@ -1460,7 +1434,7 @@ void handleBarcodeScan(String barcode) {
                         child: Icon(FontAwesomeIcons.plus, size: 12, color: Colors.green),
                       ),
                       title: Text(item.name),
-                      subtitle: Text('Code: ${item.code} | Scan: ${item.scanCode}'),
+                      subtitle: Text('${item.name} | Scan: ${item.scanCode}'),
                       trailing: Text(
                         'Qty: ${item.quantity}',
                         style: TextStyle(fontWeight: FontWeight.bold, color: Colors.green),
@@ -1501,7 +1475,7 @@ void handleBarcodeScan(String barcode) {
                           child: Icon(FontAwesomeIcons.arrowsRotate, size: 12, color: const Color.fromARGB(255, 3, 25, 55)),
                         ),
                         title: Text(entry.value.name),
-                        subtitle: Text('Code: ${entry.value.code} | Scan: ${entry.value.scanCode}'),
+                        subtitle: Text('${entry.value.name} | Scan: ${entry.value.scanCode}'),
                         trailing: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           crossAxisAlignment: CrossAxisAlignment.end,
@@ -1552,7 +1526,7 @@ void handleBarcodeScan(String barcode) {
                         child: Icon(FontAwesomeIcons.minus, size: 12, color: Colors.red),
                       ),
                       title: Text(item.name),
-                      subtitle: Text('Code: ${item.code} | Scan: ${item.scanCode}'),
+                      subtitle: Text('${item.name} | Scan: ${item.scanCode}'),
                       trailing: Text(
                         'Qty: ${item.quantity}',
                         style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red),
@@ -1768,7 +1742,7 @@ class StockItem {
   
   factory StockItem.fromJson(Map<String, dynamic> json) => StockItem(
     scanCode: json['scanCode'],
-    code: json['code'],
+    code: json['scanCode']?.toString() ?? json['code']?.toString() ?? '',
     name: json['name'],
     department: json['department'],
     rate: json['rate'],
