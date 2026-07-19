@@ -39,7 +39,7 @@ dependencies:
   path_provider: ^2.1.2
   image_picker: ^1.1.2
   carousel_slider: ^5.0.0
-  font_awesome_flutter: ^10.4.0
+  font_awesome_flutter: ^11.0.0
   dio: ^5.4.0
   shared_preferences: ^2.0.15
   encrypt: ^5.0.0
@@ -55,6 +55,7 @@ dependencies:
   google_mlkit_object_detection: ^0.15.1
   google_mlkit_text_recognition: ^0.15.1
   google_mlkit_commons: ^0.11.1
+  image: ^4.3.0
 
 dev_dependencies:
   flutter_test:

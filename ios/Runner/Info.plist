@@ -37,6 +37,15 @@
 </string>
 	<key>NSCameraUsageDescription</key>
 	<string>Used to capture images</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>CountX connects to the local fusion server for product visual recognition during development.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 	<key>NSMicrophoneInjectionUsageDescription</key>
 	<string>We need access to record videos with sound</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

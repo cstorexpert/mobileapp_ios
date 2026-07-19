@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:camera/camera.dart';
-import 'package:flutter/foundation.dart' show defaultTargetPlatform;
+import 'package:flutter/foundation.dart'
+    show debugPrint, defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
@@ -9,8 +11,12 @@ import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart
 import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 
+import 'package:countx/config/config.dart';
+import 'package:countx/models/fusion_result.dart';
 import 'package:countx/screens/transactions.dart' show StockItem, ScannedItem;
+import 'package:countx/services/fusion_api_service.dart';
 import 'package:countx/utils/camera_mlkit_input_image.dart';
+import 'package:countx/utils/fusion_frame_crop.dart';
 import 'package:countx/utils/scan_code_utils.dart';
 import 'package:countx/utils/stock_name_matcher.dart';
 
@@ -105,6 +111,11 @@ class _LiveScanScreenState extends State<LiveScanScreen>
   String? _pendingCode;
   int _stableFrameCount = 0;
   bool _framingPulseWasActive = false;
+
+  /// Phase 1: LAN MobileCLIP fuse (debug path — does not auto-add).
+  final FusionApiService _fusionApi = FusionApiService();
+  bool _fusionBusy = false;
+  FusionResult? _fusionResult;
 
   /// True while the quantity / unknown-product overlay is active.
   bool get _isInputting =>
@@ -243,10 +254,99 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     unawaited(_processCameraImage(image));
   }
 
+  /// Phase 1 debug: capture still → center-crop → LAN `/api/fuse` → overlay.
+  /// Does not call [widget.onAdd] and does not replace barcode/OCR.
+  Future<void> _runTestFusion() async {
+    if (_fusionBusy) return;
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) {
+      _showFusionSnack('Camera not ready');
+      return;
+    }
+
+    setState(() {
+      _fusionBusy = true;
+      _fusionResult = null;
+    });
+
+    try {
+      try {
+        await controller.stopImageStream();
+      } catch (_) {}
+
+      final XFile shot = await controller.takePicture();
+      final fullBytes = await File(shot.path).readAsBytes();
+      final crop = centerCropBottleJpeg(fullBytes);
+      if (crop == null) {
+        _showFusionSnack('Could not crop frame for fusion');
+        return;
+      }
+
+      final result = await _fusionApi.fuseFrame(
+        jpegBytes: crop.jpegBytes,
+        x1: 0,
+        y1: 0,
+        x2: crop.width,
+        y2: crop.height,
+        filename: 'live_crop.jpg',
+      );
+
+      if (!mounted) return;
+      if (!result.isSuccess) {
+        setState(() => _fusionResult = result);
+        _showFusionSnack(result.message ?? 'Fusion failed');
+        return;
+      }
+      setState(() => _fusionResult = result);
+    } catch (e) {
+      debugPrint('[LiveScan] Test Fusion error: $e');
+      if (mounted) {
+        setState(() => _fusionResult = FusionResult.error(e.toString()));
+        _showFusionSnack(
+          'Fusion failed. Is the sandbox running at ${AppConfig.fusionBaseUrl}?',
+        );
+      }
+    } finally {
+      try {
+        if (_cameraController != null &&
+            _cameraController!.value.isInitialized &&
+            !_cameraController!.value.isStreamingImages) {
+          await _cameraController!.startImageStream(_onCameraImage);
+        }
+      } catch (e) {
+        debugPrint('[LiveScan] resume stream after fusion: $e');
+      }
+      if (mounted) setState(() => _fusionBusy = false);
+    }
+  }
+
+  void _showFusionSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 4),
+      ),
+    );
+  }
+
+  void _dismissFusionResult() {
+    if (!mounted) return;
+    setState(() => _fusionResult = null);
+  }
+
   Future<void> _processCameraImage(CameraImage image) async {
     // INPUTTING: pause frame processing so touches and OCR cannot
     // unmount the overlay or flip product names mid-entry.
-    if (!mounted || _processingVision || _isInputting) return;
+    // Also pause while Test Fusion is running / result sheet is open.
+    if (!mounted ||
+        _processingVision ||
+        _isInputting ||
+        _fusionBusy ||
+        _fusionResult != null) {
+      return;
+    }
     final now = DateTime.now();
     if (now.difference(_lastVisionAt) < _minVisionInterval) return;
 
@@ -742,6 +842,32 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                 ),
               ),
               _buildTopBar(context),
+              if (_fusionBusy)
+                const Positioned.fill(
+                  child: ColoredBox(
+                    color: Color(0x66000000),
+                    child: Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          CircularProgressIndicator(color: Colors.white),
+                          SizedBox(height: 12),
+                          Text(
+                            'Running fusion…',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              if (_fusionResult != null)
+                Positioned.fill(
+                  child: _buildFusionResultOverlay(_fusionResult!),
+                ),
               if (needPlacementHint)
                 Positioned(
                   left: 12,
@@ -924,6 +1050,12 @@ class _LiveScanScreenState extends State<LiveScanScreen>
               ),
               const SizedBox(width: 8),
               _circleButton(
+                icon: Icons.auto_awesome,
+                onTap: _fusionBusy ? () {} : () => unawaited(_runTestFusion()),
+                tooltip: 'Test Fusion (LAN MobileCLIP)',
+              ),
+              const SizedBox(width: 8),
+              _circleButton(
                 icon: _torchOn ? Icons.flash_on : Icons.flash_off,
                 onTap: () async {
                   final c = _cameraController;
@@ -1003,8 +1135,9 @@ class _LiveScanScreenState extends State<LiveScanScreen>
   Widget _circleButton({
     required IconData icon,
     required VoidCallback onTap,
+    String? tooltip,
   }) {
-    return Material(
+    final button = Material(
       color: Colors.black54,
       shape: const CircleBorder(),
       child: InkWell(
@@ -1013,6 +1146,147 @@ class _LiveScanScreenState extends State<LiveScanScreen>
         child: Padding(
           padding: const EdgeInsets.all(10),
           child: Icon(icon, color: Colors.white, size: 20),
+        ),
+      ),
+    );
+    if (tooltip == null || tooltip.isEmpty) return button;
+    return Tooltip(message: tooltip, child: button);
+  }
+
+  /// Phase 1: show LAN fuse result only — never auto-adds to the count.
+  Widget _buildFusionResultOverlay(FusionResult result) {
+    final ok = result.isSuccess && result.scanCode.isNotEmpty;
+    return Material(
+      color: Colors.black.withValues(alpha: 0.55),
+      child: SafeArea(
+        child: Align(
+          alignment: Alignment.bottomCenter,
+          child: Container(
+            margin: const EdgeInsets.fromLTRB(12, 12, 12, 16),
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x66000000),
+                  blurRadius: 18,
+                  offset: Offset(0, 6),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      ok ? Icons.auto_awesome : Icons.error_outline,
+                      color: ok ? Colors.teal.shade700 : Colors.red.shade700,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        ok ? 'Fusion result (debug)' : 'Fusion error',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w800,
+                          fontSize: 15,
+                          color: _navy,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      onPressed: _dismissFusionResult,
+                      icon: const Icon(Icons.close),
+                    ),
+                  ],
+                ),
+                if (!ok) ...[
+                  Text(
+                    result.message ?? 'Unknown fusion error',
+                    style: TextStyle(color: Colors.red.shade800, height: 1.3),
+                  ),
+                ] else ...[
+                  Text(
+                    result.excelName.isNotEmpty
+                        ? result.excelName
+                        : result.skuName,
+                    style: const TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.w700,
+                      color: _navy,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'scan_code: ${result.scanCode}',
+                    style: TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 13,
+                      color: Colors.grey.shade800,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'confidence: ${result.confidence.toStringAsFixed(3)} · '
+                    '${result.resolutionStatus}',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey.shade700,
+                    ),
+                  ),
+                  if (result.topK.length > 1) ...[
+                    const SizedBox(height: 10),
+                    Text(
+                      'Top matches',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        color: Colors.grey.shade800,
+                        fontSize: 12,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    ...result.topK.take(3).map(
+                      (c) => Padding(
+                        padding: const EdgeInsets.only(bottom: 2),
+                        child: Text(
+                          '${c.score.toStringAsFixed(3)}  ${c.scanCode}  '
+                          '${c.excelName.isNotEmpty ? c.excelName : c.skuName}',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: Colors.grey.shade800,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 8),
+                  Text(
+                    'Phase 1: preview only — does not add to the count.',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: Colors.grey.shade600,
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 10),
+                FilledButton(
+                  onPressed: _dismissFusionResult,
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _navy,
+                    foregroundColor: Colors.white,
+                  ),
+                  child: const Text('Close'),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -1166,7 +1440,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                     color: _navy.withValues(alpha: 0.08),
                     borderRadius: BorderRadius.circular(14),
                   ),
-                  child: const Icon(
+                  child: const FaIcon(
                     FontAwesomeIcons.boxesStacked,
                     color: _navy,
                     size: 24,
@@ -1227,7 +1501,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
               ),
               child: Row(
                 children: [
-                  const Icon(FontAwesomeIcons.barcode,
+                  const FaIcon(FontAwesomeIcons.barcode,
                       size: 12, color: Colors.grey),
                   const SizedBox(width: 8),
                   Expanded(
@@ -1387,7 +1661,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Icon(FontAwesomeIcons.triangleExclamation,
+              FaIcon(FontAwesomeIcons.triangleExclamation,
                   color: Colors.orange.shade700),
               const SizedBox(width: 12),
               Expanded(
