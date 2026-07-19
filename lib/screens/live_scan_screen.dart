@@ -13,8 +13,9 @@ import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart
 
 import 'package:countx/config/config.dart';
 import 'package:countx/models/fusion_result.dart';
+import 'package:countx/models/identification_result.dart';
 import 'package:countx/screens/transactions.dart' show StockItem, ScannedItem;
-import 'package:countx/services/fusion_api_service.dart';
+import 'package:countx/services/product_identification_service.dart';
 import 'package:countx/utils/camera_mlkit_input_image.dart';
 import 'package:countx/utils/fusion_frame_crop.dart';
 import 'package:countx/utils/scan_code_utils.dart';
@@ -37,6 +38,9 @@ enum _UnknownSheetPhase {
 /// Live scan using the device camera + on-device ML Kit: object gate, barcode
 /// decode, then OCR + fuzzy name match on the label when no barcode is read
 /// (e.g. bottle facing camera without a visible code).
+///
+/// Phase 2 visual: LAN MobileCLIP runs only when the user taps ✨ (fusion).
+/// Normal Live Scan stays barcode → OCR. CLIP never overrides a barcode hit.
 ///
 /// Not-in-sheet flow: user can inject a row into [previousStock] and add with
 /// `__source: manual` so it appears in the missing-items report.
@@ -112,15 +116,18 @@ class _LiveScanScreenState extends State<LiveScanScreen>
   int _stableFrameCount = 0;
   bool _framingPulseWasActive = false;
 
-  /// Phase 1: LAN MobileCLIP fuse (debug path — does not auto-add).
-  final FusionApiService _fusionApi = FusionApiService();
+  /// Phase 2: ✨-triggered LAN MobileCLIP (never auto-runs in the camera loop).
+  final ProductIdentificationService _productId =
+      ProductIdentificationService();
   bool _fusionBusy = false;
-  FusionResult? _fusionResult;
+  FusionResult? _fusionDebugResult;
+  List<VisualCandidate>? _visualPickerCandidates;
 
-  /// True while the quantity / unknown-product overlay is active.
+  /// True while the quantity / unknown / visual-picker overlay is active.
   bool get _isInputting =>
-      _lockPhase == _LockPhase.locked &&
-      (_currentProduct != null || _isUnknownProduct);
+      _visualPickerCandidates != null ||
+      (_lockPhase == _LockPhase.locked &&
+          (_currentProduct != null || _isUnknownProduct));
 
   @override
   void initState() {
@@ -254,10 +261,14 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     unawaited(_processCameraImage(image));
   }
 
-  /// Phase 1 debug: capture still → center-crop → LAN `/api/fuse` → overlay.
-  /// Does not call [widget.onAdd] and does not replace barcode/OCR.
-  Future<void> _runTestFusion() async {
+  /// ✨ button: capture still → LAN MobileCLIP → top-k / product card.
+  /// Does not replace barcode/OCR during normal scanning; never auto-adds.
+  Future<void> _runFusionIdentify() async {
     if (_fusionBusy) return;
+    if (AppConfig.fusionBaseUrl.isEmpty) {
+      _showFusionSnack('fusionBaseUrl is empty in config.dart');
+      return;
+    }
     final controller = _cameraController;
     if (controller == null || !controller.value.isInitialized) {
       _showFusionSnack('Camera not ready');
@@ -266,7 +277,8 @@ class _LiveScanScreenState extends State<LiveScanScreen>
 
     setState(() {
       _fusionBusy = true;
-      _fusionResult = null;
+      _fusionDebugResult = null;
+      _visualPickerCandidates = null;
     });
 
     try {
@@ -282,26 +294,54 @@ class _LiveScanScreenState extends State<LiveScanScreen>
         return;
       }
 
-      final result = await _fusionApi.fuseFrame(
+      final result = await _productId.identifyFromCrop(
         jpegBytes: crop.jpegBytes,
-        x1: 0,
-        y1: 0,
-        x2: crop.width,
-        y2: crop.height,
-        filename: 'live_crop.jpg',
+        width: crop.width,
+        height: crop.height,
+        previousStock: widget.previousStock,
       );
 
       if (!mounted) return;
-      if (!result.isSuccess) {
-        setState(() => _fusionResult = result);
-        _showFusionSnack(result.message ?? 'Fusion failed');
+
+      if (!result.hasVisualClaim) {
+        final raw = result.raw;
+        if (raw != null && !raw.isSuccess) {
+          setState(() => _fusionDebugResult = raw);
+          _showFusionSnack(raw.message ?? 'Fusion failed');
+        } else {
+          _showFusionSnack(
+            result.message ??
+                'No confident visual match. Try framing the product clearly.',
+          );
+        }
         return;
       }
-      setState(() => _fusionResult = result);
+
+      if (result.band == VisualConfidenceBand.high &&
+          result.scanCode != null &&
+          result.scanCode!.isNotEmpty) {
+        debugPrint(
+          '[LiveScan] ✨ HIGH → ${result.scanCode} '
+          '(${result.candidates.first.score.toStringAsFixed(3)})',
+        );
+        _handleCodeRead(
+          result.scanCode!,
+          sourceBarcode: false,
+          itemSource: 'visual',
+        );
+        return;
+      }
+
+      final picks = result.candidates.take(3).toList();
+      debugPrint(
+        '[LiveScan] ✨ MEDIUM → picker ${picks.length} '
+        'top=${picks.first.scanCode} ${picks.first.score.toStringAsFixed(3)}',
+      );
+      setState(() => _visualPickerCandidates = picks);
     } catch (e) {
-      debugPrint('[LiveScan] Test Fusion error: $e');
+      debugPrint('[LiveScan] ✨ fusion error: $e');
       if (mounted) {
-        setState(() => _fusionResult = FusionResult.error(e.toString()));
+        setState(() => _fusionDebugResult = FusionResult.error(e.toString()));
         _showFusionSnack(
           'Fusion failed. Is the sandbox running at ${AppConfig.fusionBaseUrl}?',
         );
@@ -333,20 +373,24 @@ class _LiveScanScreenState extends State<LiveScanScreen>
 
   void _dismissFusionResult() {
     if (!mounted) return;
-    setState(() => _fusionResult = null);
+    setState(() => _fusionDebugResult = null);
   }
 
   Future<void> _processCameraImage(CameraImage image) async {
-    // INPUTTING: pause frame processing so touches and OCR cannot
-    // unmount the overlay or flip product names mid-entry.
-    // Also pause while Test Fusion is running / result sheet is open.
+    // Traditional Live Scan: barcode → OCR only.
+    // Pause while ✨ fusion is running, debug overlay is open, or qty/unknown
+    // card is locked. Visual picker (from ✨) stays open to camera so barcode
+    // can still win.
+    final lockedOnCard = _lockPhase == _LockPhase.locked &&
+        (_currentProduct != null || _isUnknownProduct);
     if (!mounted ||
         _processingVision ||
-        _isInputting ||
+        lockedOnCard ||
         _fusionBusy ||
-        _fusionResult != null) {
+        _fusionDebugResult != null) {
       return;
     }
+    final pickerOpen = _visualPickerCandidates != null;
     final now = DateTime.now();
     if (now.difference(_lastVisionAt) < _minVisionInterval) return;
 
@@ -373,7 +417,9 @@ class _LiveScanScreenState extends State<LiveScanScreen>
 
       // Start OCR as soon as we know there is no barcode, while object finishes.
       final Future<RecognizedText>? ocrFuture =
-          (raw == null || raw.isEmpty) ? _textRecognizer.processImage(input) : null;
+          (raw == null || raw.isEmpty) && !pickerOpen
+              ? _textRecognizer.processImage(input)
+              : null;
 
       final objects = await objectFuture;
 
@@ -391,11 +437,15 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       }
 
       if (raw != null && raw.isNotEmpty) {
+        if (pickerOpen && mounted) {
+          setState(() => _visualPickerCandidates = null);
+        }
         _handleCodeRead(raw, sourceBarcode: true);
         return;
       }
 
-      if (ocrFuture == null) return;
+      // Keep ✨ top-k until user picks/dismisses; no CLIP in the camera loop.
+      if (pickerOpen || ocrFuture == null) return;
 
       final recognized = await ocrFuture;
       final text = recognized.text.trim();
@@ -417,20 +467,30 @@ class _LiveScanScreenState extends State<LiveScanScreen>
           setState(() => _ocrNoMatchSnippet = null);
         }
         _handleCodeRead(code, sourceBarcode: false);
-      } else {
-        if (mounted) {
-          setState(() {
-            _ocrNoMatchSnippet = text.length > 120
-                ? '${text.substring(0, 120)}…'
-                : text;
-          });
-        }
+      } else if (mounted) {
+        setState(() {
+          _ocrNoMatchSnippet = text.length > 120
+              ? '${text.substring(0, 120)}…'
+              : text;
+        });
       }
     } catch (e) {
       debugPrint('[LiveScan] frame error: $e');
     } finally {
       _processingVision = false;
     }
+  }
+
+  void _dismissVisualPicker() {
+    if (!mounted) return;
+    setState(() => _visualPickerCandidates = null);
+  }
+
+  void _onVisualCandidatePicked(VisualCandidate c) {
+    final code = c.scanCode;
+    if (code.isEmpty) return;
+    setState(() => _visualPickerCandidates = null);
+    _handleCodeRead(code, sourceBarcode: false, itemSource: 'visual');
   }
 
   /// Optional visual hint only (barcode/OCR are **not** gated on this).
@@ -462,8 +522,15 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     return best;
   }
 
-  void _handleCodeRead(String rawCode, {required bool sourceBarcode}) {
-    if (!mounted || _isInputting) return;
+  void _handleCodeRead(
+    String rawCode, {
+    required bool sourceBarcode,
+    String itemSource = 'scanner',
+  }) {
+    // Allow locking a product while the visual picker is open (user just picked).
+    final pickerOpen = _visualPickerCandidates != null;
+    if (!mounted) return;
+    if (_isInputting && !pickerOpen) return;
 
     final code = normalizeScanCode(rawCode);
     if (code.isEmpty) return;
@@ -472,41 +539,63 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       return;
     }
 
-    if (_pendingCode != code) {
-      _pendingCode = code;
-      _stableFrameCount = 1;
-      setState(() {
-        _lockPhase = _LockPhase.locking;
-        if (!sourceBarcode) {
-          _ocrNoMatchSnippet = null;
-        }
-      });
-      _resetHideTimer();
-      return;
-    }
+    // Visual picks: skip multi-frame stability (user picked, or high-band claim).
+    // Barcode + OCR keep the existing hold-steady lock.
+    final skipStability = itemSource == 'visual' || pickerOpen;
 
-    _stableFrameCount++;
-
-    if (_stableFrameCount < _stableFramesNeeded) {
-      if (_lockPhase == _LockPhase.locking) {
-        setState(() {});
+    if (!skipStability) {
+      if (_pendingCode != code) {
+        _pendingCode = code;
+        _stableFrameCount = 1;
+        setState(() {
+          _lockPhase = _LockPhase.locking;
+          if (!sourceBarcode) {
+            _ocrNoMatchSnippet = null;
+          }
+        });
+        _resetHideTimer();
+        return;
       }
-      _resetHideTimer();
-      return;
+
+      _stableFrameCount++;
+
+      if (_stableFrameCount < _stableFramesNeeded) {
+        if (_lockPhase == _LockPhase.locking) {
+          setState(() {});
+        }
+        _resetHideTimer();
+        return;
+      }
     }
 
     _lastBarcode = code;
     _lockPhase = _LockPhase.locked;
     _hideTimer?.cancel();
     _hideTimer = null;
+    _pendingCode = code;
+    _stableFrameCount = _stableFramesNeeded;
 
     final found = lookupStockByScanCode(widget.previousStock, code);
 
+    // CLIP must not invent unknown Excel rows — only barcode may open unknown.
+    if (found == null && !sourceBarcode && itemSource == 'visual') {
+      debugPrint('[LiveScan] visual code not in sheet: $code — ignored');
+      setState(() {
+        _visualPickerCandidates = null;
+        _lockPhase = _LockPhase.ready;
+        _lastBarcode = null;
+        _pendingCode = null;
+        _stableFrameCount = 0;
+      });
+      return;
+    }
+
     setState(() {
+      _visualPickerCandidates = null;
       _detectedCode = code;
       _ocrNoMatchSnippet = null;
       if (found != null) {
-        _scannedItemSource = 'scanner';
+        _scannedItemSource = itemSource;
         _unknownPhase = _UnknownSheetPhase.prompt;
         if (_currentProduct?.scanCode != found.scanCode) {
           _manualCount = 1;
@@ -517,6 +606,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
         _currentProduct = null;
         _isUnknownProduct = true;
         _unknownPhase = _UnknownSheetPhase.prompt;
+        _scannedItemSource = itemSource;
       }
     });
 
@@ -560,6 +650,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       _pendingCode = null;
       _stableFrameCount = 0;
       _ocrNoMatchSnippet = null;
+      _visualPickerCandidates = null;
       if (resetManualQty) {
         _manualCount = 1;
         _syncQtyFieldFromState();
@@ -766,7 +857,9 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     }
 
     final controller = _cameraController;
-    final hasCard = _currentProduct != null || _isUnknownProduct;
+    final hasCard = _currentProduct != null ||
+        _isUnknownProduct ||
+        _visualPickerCandidates != null;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -853,7 +946,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                           CircularProgressIndicator(color: Colors.white),
                           SizedBox(height: 12),
                           Text(
-                            'Running fusion…',
+                            'Running visual match…',
                             style: TextStyle(
                               color: Colors.white,
                               fontWeight: FontWeight.w600,
@@ -864,9 +957,9 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                     ),
                   ),
                 ),
-              if (_fusionResult != null)
+              if (_fusionDebugResult != null)
                 Positioned.fill(
-                  child: _buildFusionResultOverlay(_fusionResult!),
+                  child: _buildFusionResultOverlay(_fusionDebugResult!),
                 ),
               if (needPlacementHint)
                 Positioned(
@@ -928,11 +1021,16 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                       child: FadeTransition(opacity: anim, child: child),
                     ),
                     child: hasCard
-                        ? (_currentProduct != null
-                            ? _buildProductCard(_currentProduct!)
-                            : (_unknownPhase == _UnknownSheetPhase.miniForm
-                                ? _buildUnknownMiniForm(_detectedCode ?? '')
-                                : _buildUnknownPrompt(_detectedCode ?? '')))
+                        ? (_visualPickerCandidates != null
+                            ? _buildVisualPickerCard(_visualPickerCandidates!)
+                            : (_currentProduct != null
+                                ? _buildProductCard(_currentProduct!)
+                                : (_unknownPhase ==
+                                        _UnknownSheetPhase.miniForm
+                                    ? _buildUnknownMiniForm(
+                                        _detectedCode ?? '')
+                                    : _buildUnknownPrompt(
+                                        _detectedCode ?? ''))))
                         : _buildBottomHint(),
                     ),
                   ),
@@ -1051,8 +1149,9 @@ class _LiveScanScreenState extends State<LiveScanScreen>
               const SizedBox(width: 8),
               _circleButton(
                 icon: Icons.auto_awesome,
-                onTap: _fusionBusy ? () {} : () => unawaited(_runTestFusion()),
-                tooltip: 'Test Fusion (LAN MobileCLIP)',
+                onTap:
+                    _fusionBusy ? () {} : () => unawaited(_runFusionIdentify()),
+                tooltip: 'Visual match (LAN MobileCLIP)',
               ),
               const SizedBox(width: 8),
               _circleButton(
@@ -1153,7 +1252,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     return Tooltip(message: tooltip, child: button);
   }
 
-  /// Phase 1: show LAN fuse result only — never auto-adds to the count.
+  /// Error/debug sheet when ✨ fusion fails (success uses product card / picker).
   Widget _buildFusionResultOverlay(FusionResult result) {
     final ok = result.isSuccess && result.scanCode.isNotEmpty;
     return Material(
@@ -1188,7 +1287,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        ok ? 'Fusion result (debug)' : 'Fusion error',
+                        ok ? 'Fusion details' : 'Fusion error',
                         style: TextStyle(
                           fontWeight: FontWeight.w800,
                           fontSize: 15,
@@ -1267,7 +1366,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                   ],
                   const SizedBox(height: 8),
                   Text(
-                    'Phase 1: preview only — does not add to the count.',
+                    'Fusion error details — tap ✨ again after fixing the server.',
                     style: TextStyle(
                       fontSize: 11,
                       color: Colors.grey.shade600,
@@ -1402,8 +1501,137 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     );
   }
 
+  /// Phase 2 medium-confidence UX: pick among Excel-mapped CLIP candidates.
+  Widget _buildVisualPickerCard(List<VisualCandidate> candidates) {
+    return Container(
+      key: ValueKey(
+        'visual-picker-${candidates.map((c) => c.scanCode).join(',')}',
+      ),
+      margin: const EdgeInsets.fromLTRB(6, 0, 6, 4),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.28),
+            blurRadius: 22,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.auto_awesome, color: Colors.teal.shade700, size: 20),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'Select matching product',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 15,
+                      color: _navy,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  tooltip: 'Dismiss',
+                  onPressed: _dismissVisualPicker,
+                  icon: const Icon(Icons.close),
+                ),
+              ],
+            ),
+            Text(
+              'Visual match — confirm before adding',
+              style: TextStyle(
+                fontSize: 12,
+                color: Colors.grey.shade700,
+              ),
+            ),
+            const SizedBox(height: 10),
+            ...candidates.map((c) {
+              final scorePct = (c.score * 100).clamp(0, 999).toStringAsFixed(0);
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Material(
+                  color: Colors.teal.shade50,
+                  borderRadius: BorderRadius.circular(12),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(12),
+                    onTap: () => _onVisualCandidatePicked(c),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 12,
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 44,
+                            alignment: Alignment.center,
+                            child: Text(
+                              '$scorePct%',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w800,
+                                fontSize: 13,
+                                color: Colors.teal.shade900,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  c.displayName,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 14,
+                                    color: _navy,
+                                  ),
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  c.scanCode,
+                                  style: TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 11,
+                                    color: Colors.grey.shade700,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Icon(
+                            Icons.chevron_right,
+                            color: Colors.teal.shade700,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildProductCard(StockItem p) {
     final scanCode = p.scanCode ?? _detectedCode ?? '';
+    final isVisual = _scannedItemSource == 'visual';
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: () {
@@ -1461,6 +1689,28 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                         maxLines: 3,
                         overflow: TextOverflow.ellipsis,
                       ),
+                      if (isVisual) ...[
+                        const SizedBox(height: 4),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.teal.shade50,
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: Colors.teal.shade200),
+                          ),
+                          child: Text(
+                            'Visual match',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.teal.shade800,
+                            ),
+                          ),
+                        ),
+                      ],
                       const SizedBox(height: 4),
                       Text(
                         '${p.department.isEmpty ? '—' : p.department}  •  Code ${p.code}',

@@ -1,0 +1,181 @@
+import 'dart:typed_data';
+
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
+
+import 'package:countx/models/fusion_result.dart';
+import 'package:countx/models/identification_result.dart';
+import 'package:countx/screens/transactions.dart' show StockItem;
+import 'package:countx/services/fusion_api_service.dart';
+import 'package:countx/utils/scan_code_utils.dart';
+
+/// Orchestrates LAN MobileCLIP fuse + confidence banding for Live Scan.
+///
+/// Does not touch barcode/OCR — callers invoke this only after those miss.
+class ProductIdentificationService {
+  ProductIdentificationService({FusionApiService? fusionApi})
+      : _fusionApi = fusionApi ??
+            FusionApiService(
+              dio: Dio(
+                BaseOptions(
+                  // Cascade must fail faster than the debug Test Fusion path.
+                  connectTimeout: const Duration(seconds: 5),
+                  receiveTimeout: const Duration(seconds: 18),
+                  sendTimeout: const Duration(seconds: 18),
+                ),
+              ),
+            );
+
+  final FusionApiService _fusionApi;
+
+  FusionApiService get fusionApi => _fusionApi;
+
+  /// Phone LAN crops often land ~0.45–0.55; keep high rare, medium as default UX.
+  static const double highScoreThreshold = 0.70;
+  static const double highMarginThreshold = 0.08;
+
+  /// Show top-k picker at/above this (covers typical ~0.50 demos).
+  static const double mediumScoreThreshold = 0.38;
+
+  /// Below this → no visual claim.
+  static const double lowScoreFloor = 0.30;
+
+  /// Runs `/api/fuse` on a center crop and maps winners to Excel rows only.
+  Future<IdentificationResult> identifyFromCrop({
+    required Uint8List jpegBytes,
+    required int width,
+    required int height,
+    required Map<String, StockItem> previousStock,
+  }) async {
+    if (_fusionApi.baseUrl.isEmpty) {
+      return IdentificationResult.none(message: 'fusionBaseUrl is empty');
+    }
+
+    final raw = await _fusionApi.fuseFrame(
+      jpegBytes: jpegBytes,
+      x1: 0,
+      y1: 0,
+      x2: width,
+      y2: height,
+      filename: 'live_crop.jpg',
+    );
+
+    if (!raw.isSuccess) {
+      return IdentificationResult.none(
+        message: raw.message ?? 'Fusion failed',
+        raw: raw,
+      );
+    }
+
+    final mapped = _mapInSheetCandidates(raw, previousStock);
+    if (mapped.isEmpty) {
+      debugPrint(
+        '[ProductID] fuse ok but no Excel-mapped candidates '
+        '(winner=${raw.scanCode} conf=${raw.confidence.toStringAsFixed(3)})',
+      );
+      return IdentificationResult.none(
+        message: 'No Excel match for visual candidates',
+        raw: raw,
+      );
+    }
+
+    final band = classifyBand(
+      top1Score: mapped.first.score,
+      margin: mapped.length > 1
+          ? mapped.first.score - mapped[1].score
+          : mapped.first.score,
+      rawConfidence: raw.confidence,
+    );
+
+    if (band == VisualConfidenceBand.low) {
+      return IdentificationResult(
+        source: IdentificationSource.none,
+        band: band,
+        candidates: mapped,
+        message: 'Visual confidence too low',
+        raw: raw,
+      );
+    }
+
+    return IdentificationResult(
+      source: IdentificationSource.visual,
+      band: band,
+      scanCode: mapped.first.scanCode,
+      candidates: mapped.take(3).toList(),
+      raw: raw,
+    );
+  }
+
+  /// Public for tests / tuning.
+  VisualConfidenceBand classifyBand({
+    required double top1Score,
+    required double margin,
+    double? rawConfidence,
+  }) {
+    final score = top1Score;
+    if (score < lowScoreFloor) return VisualConfidenceBand.low;
+
+    if (score >= highScoreThreshold && margin >= highMarginThreshold) {
+      return VisualConfidenceBand.high;
+    }
+
+    if (score >= mediumScoreThreshold) {
+      return VisualConfidenceBand.medium;
+    }
+
+    // Soft floor: if server confidence is a bit higher than mapped top1, still
+    // allow picker when above floor (rare mismatch).
+    final server = rawConfidence ?? score;
+    if (server >= mediumScoreThreshold && score >= lowScoreFloor) {
+      return VisualConfidenceBand.medium;
+    }
+
+    return VisualConfidenceBand.low;
+  }
+
+  List<VisualCandidate> _mapInSheetCandidates(
+    FusionResult raw,
+    Map<String, StockItem> previousStock,
+  ) {
+    final seen = <String>{};
+    final out = <VisualCandidate>[];
+
+    void consider(String scanCode, String displayName, double score) {
+      final code = normalizeScanCode(scanCode);
+      if (code.isEmpty || seen.contains(code)) return;
+      final stock = lookupStockByScanCode(previousStock, code);
+      if (stock == null) return;
+      seen.add(code);
+      out.add(
+        VisualCandidate(
+          scanCode: stock.scanCode ?? code,
+          displayName: stock.name.isNotEmpty
+              ? stock.name
+              : (displayName.isNotEmpty ? displayName : code),
+          score: score,
+          stockItem: stock,
+        ),
+      );
+    }
+
+    for (final c in raw.topK) {
+      consider(
+        c.scanCode,
+        c.excelName.isNotEmpty ? c.excelName : c.skuName,
+        c.score,
+      );
+    }
+
+    // Ensure winner is considered even if top_k omitted it.
+    if (raw.scanCode.isNotEmpty) {
+      consider(
+        raw.scanCode,
+        raw.excelName.isNotEmpty ? raw.excelName : raw.skuName,
+        raw.confidence,
+      );
+      out.sort((a, b) => b.score.compareTo(a.score));
+    }
+
+    return out;
+  }
+}
