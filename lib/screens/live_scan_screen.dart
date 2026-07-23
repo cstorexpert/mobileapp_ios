@@ -15,6 +15,7 @@ import 'package:countx/config/config.dart';
 import 'package:countx/models/fusion_result.dart';
 import 'package:countx/models/identification_result.dart';
 import 'package:countx/screens/transactions.dart' show StockItem, ScannedItem;
+import 'package:countx/services/product_enrollment_service.dart';
 import 'package:countx/services/product_identification_service.dart';
 import 'package:countx/utils/camera_mlkit_input_image.dart';
 import 'package:countx/utils/fusion_frame_crop.dart';
@@ -41,6 +42,9 @@ enum _UnknownSheetPhase {
 ///
 /// Phase 2 visual: LAN MobileCLIP runs only when the user taps ✨ (fusion).
 /// Normal Live Scan stays barcode → OCR. CLIP never overrides a barcode hit.
+///
+/// Phase 3 Save appearance: barcode identifies Excel scan_code only; enroll
+/// happens on explicit face-forward Save appearance (not on ADD / barcode lock).
 ///
 /// Not-in-sheet flow: user can inject a row into [previousStock] and add with
 /// `__source: manual` so it appears in the missing-items report.
@@ -119,13 +123,26 @@ class _LiveScanScreenState extends State<LiveScanScreen>
   /// Phase 2: ✨-triggered LAN MobileCLIP (never auto-runs in the camera loop).
   final ProductIdentificationService _productId =
       ProductIdentificationService();
+  final ProductEnrollmentService _enrollment = ProductEnrollmentService();
   bool _fusionBusy = false;
   FusionResult? _fusionDebugResult;
   List<VisualCandidate>? _visualPickerCandidates;
 
+  /// Face crop from ✨ (or capture) for Save appearance after barcode link.
+  Uint8List? _pendingEnrollCrop;
+
+  /// ✨ open-set unknown — offer Save appearance (no forced seed SKU).
+  bool _showUnknownVisualCard = false;
+
+  /// After Save appearance from ✨ unknown / None of these: wait for barcode.
+  bool _awaitingBarcodeForEnroll = false;
+
+  bool _savingAppearance = false;
+
   /// True while the quantity / unknown / visual-picker overlay is active.
   bool get _isInputting =>
       _visualPickerCandidates != null ||
+      _showUnknownVisualCard ||
       (_lockPhase == _LockPhase.locked &&
           (_currentProduct != null || _isUnknownProduct));
 
@@ -279,6 +296,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       _fusionBusy = true;
       _fusionDebugResult = null;
       _visualPickerCandidates = null;
+      _showUnknownVisualCard = false;
     });
 
     try {
@@ -294,6 +312,9 @@ class _LiveScanScreenState extends State<LiveScanScreen>
         return;
       }
 
+      // Face crop for Save appearance (barcode-link or locked-card save).
+      _pendingEnrollCrop = crop.jpegBytes;
+
       final result = await _productId.identifyFromCrop(
         jpegBytes: crop.jpegBytes,
         width: crop.width,
@@ -308,12 +329,14 @@ class _LiveScanScreenState extends State<LiveScanScreen>
         if (raw != null && !raw.isSuccess) {
           setState(() => _fusionDebugResult = raw);
           _showFusionSnack(raw.message ?? 'Fusion failed');
-        } else {
-          _showFusionSnack(
-            result.message ??
-                'No confident visual match. Try framing the product clearly.',
-          );
+          return;
         }
+        // Open-set / low confidence — do not force a seed SKU.
+        debugPrint('[LiveScan] ✨ UNKNOWN visual — Save appearance offered');
+        setState(() {
+          _showUnknownVisualCard = true;
+          _fusionDebugResult = raw;
+        });
         return;
       }
 
@@ -437,8 +460,11 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       }
 
       if (raw != null && raw.isNotEmpty) {
-        if (pickerOpen && mounted) {
-          setState(() => _visualPickerCandidates = null);
+        if (mounted && (pickerOpen || _showUnknownVisualCard)) {
+          setState(() {
+            _visualPickerCandidates = null;
+            _showUnknownVisualCard = false;
+          });
         }
         _handleCodeRead(raw, sourceBarcode: true);
         return;
@@ -486,11 +512,38 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     setState(() => _visualPickerCandidates = null);
   }
 
+  void _dismissUnknownVisualCard() {
+    if (!mounted) return;
+    setState(() {
+      _showUnknownVisualCard = false;
+      _pendingEnrollCrop = null;
+    });
+  }
+
   void _onVisualCandidatePicked(VisualCandidate c) {
     final code = c.scanCode;
     if (code.isEmpty) return;
     setState(() => _visualPickerCandidates = null);
     _handleCodeRead(code, sourceBarcode: false, itemSource: 'visual');
+  }
+
+  /// ✨ unknown / None of these: keep face crop, wait for barcode identity.
+  void _beginBarcodeLinkForEnroll() {
+    if (!mounted) return;
+    setState(() {
+      _showUnknownVisualCard = false;
+      _visualPickerCandidates = null;
+      _awaitingBarcodeForEnroll = true;
+      _currentProduct = null;
+      _isUnknownProduct = false;
+      _lockPhase = _LockPhase.ready;
+      _lastBarcode = null;
+      _pendingCode = null;
+      _stableFrameCount = 0;
+    });
+    _showFusionSnack(
+      'Turn the pack face-forward in frame, then scan the barcode to link.',
+    );
   }
 
   /// Optional visual hint only (barcode/OCR are **not** gated on this).
@@ -527,15 +580,17 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     required bool sourceBarcode,
     String itemSource = 'scanner',
   }) {
-    // Allow locking a product while the visual picker is open (user just picked).
+    // Allow locking while picker is open, or while linking appearance via barcode.
     final pickerOpen = _visualPickerCandidates != null;
     if (!mounted) return;
-    if (_isInputting && !pickerOpen) return;
+    if (_isInputting && !pickerOpen && !_awaitingBarcodeForEnroll) return;
 
     final code = normalizeScanCode(rawCode);
     if (code.isEmpty) return;
 
-    if (_lockPhase == _LockPhase.locked && _lastBarcode == code) {
+    if (_lockPhase == _LockPhase.locked &&
+        _lastBarcode == code &&
+        !_awaitingBarcodeForEnroll) {
       return;
     }
 
@@ -590,8 +645,14 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       return;
     }
 
+    final wasLinking = _awaitingBarcodeForEnroll;
+    final StockItem? linkProduct =
+        (wasLinking && sourceBarcode) ? found : null;
+
     setState(() {
       _visualPickerCandidates = null;
+      _showUnknownVisualCard = false;
+      _awaitingBarcodeForEnroll = false;
       _detectedCode = code;
       _ocrNoMatchSnippet = null;
       if (found != null) {
@@ -607,10 +668,23 @@ class _LiveScanScreenState extends State<LiveScanScreen>
         _isUnknownProduct = true;
         _unknownPhase = _UnknownSheetPhase.prompt;
         _scannedItemSource = itemSource;
+        if (wasLinking) {
+          // Barcode not in sheet — cannot enroll under an Excel scan_code.
+          _pendingEnrollCrop = null;
+        }
       }
     });
 
     _syncQtyFieldFromState();
+
+    // Face-forward enroll after barcode identity (Save appearance link flow).
+    if (linkProduct != null) {
+      unawaited(_enrollAfterBarcodeLink(linkProduct));
+    } else if (wasLinking && found == null && mounted) {
+      _showFusionSnack(
+        'Barcode not in Excel — cannot save appearance for this code',
+      );
+    }
   }
 
   void _syncQtyFieldFromState() {
@@ -651,6 +725,10 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       _stableFrameCount = 0;
       _ocrNoMatchSnippet = null;
       _visualPickerCandidates = null;
+      _pendingEnrollCrop = null;
+      _showUnknownVisualCard = false;
+      _awaitingBarcodeForEnroll = false;
+      _savingAppearance = false;
       if (resetManualQty) {
         _manualCount = 1;
         _syncQtyFieldFromState();
@@ -731,7 +809,169 @@ class _LiveScanScreenState extends State<LiveScanScreen>
         behavior: SnackBarBehavior.floating,
       ),
     );
+    // ADD is count-only — appearance enroll is explicit Save appearance.
     _clearScanUiForNextItem(resetManualQty: true);
+  }
+
+  /// Locked Excel card: user confirmed face-forward → capture + enroll.
+  Future<void> _saveAppearanceForLockedProduct() async {
+    final product = _currentProduct;
+    if (product == null || _savingAppearance) return;
+    final scanCode = product.scanCode ?? _detectedCode ?? '';
+    if (scanCode.isEmpty) {
+      _showFusionSnack('No scan code — cannot save appearance');
+      return;
+    }
+
+    setState(() => _savingAppearance = true);
+    try {
+      // Always capture now — barcode-side frames must not be reused.
+      final cropBytes = await _captureEnrollCrop();
+      if (cropBytes == null) {
+        if (mounted) {
+          _showFusionSnack('Could not capture a clear face crop');
+        }
+        return;
+      }
+      await _runEnroll(
+        scanCode: scanCode,
+        skuName: _displayNameForEnroll(product, scanCode),
+        department: product.department.isNotEmpty
+            ? product.department
+            : widget.allocatedDepartment,
+        jpegBytes: cropBytes,
+        source: _scannedItemSource,
+      );
+    } finally {
+      if (mounted) setState(() => _savingAppearance = false);
+    }
+  }
+
+  /// After ✨ Save appearance → barcode lock: enroll face crop under scan_code.
+  Future<void> _enrollAfterBarcodeLink(StockItem product) async {
+    final scanCode = product.scanCode ?? _detectedCode ?? '';
+    if (scanCode.isEmpty) return;
+
+    setState(() => _savingAppearance = true);
+    try {
+      // Prefer ✨ face crop; if missing, capture now (user should face-forward).
+      Uint8List? cropBytes = _pendingEnrollCrop;
+      cropBytes ??= await _captureEnrollCrop();
+      if (cropBytes == null) {
+        if (mounted) {
+          _showFusionSnack(
+            'Linked $scanCode — hold face in frame and tap Save appearance',
+          );
+        }
+        return;
+      }
+      await _runEnroll(
+        scanCode: scanCode,
+        skuName: _displayNameForEnroll(product, scanCode),
+        department: product.department.isNotEmpty
+            ? product.department
+            : widget.allocatedDepartment,
+        jpegBytes: cropBytes,
+        source: 'scanner',
+      );
+      _pendingEnrollCrop = null;
+    } finally {
+      if (mounted) setState(() => _savingAppearance = false);
+    }
+  }
+
+  String _displayNameForEnroll(StockItem product, String scanCode) {
+    if (product.name.trim().isNotEmpty) return product.name.trim();
+    if (product.code.trim().isNotEmpty) return product.code.trim();
+    return scanCode;
+  }
+
+  Future<void> _runEnroll({
+    required String scanCode,
+    required String skuName,
+    required String department,
+    required Uint8List jpegBytes,
+    required String source,
+  }) async {
+    final result = await _enrollment.enrollAfterConfirm(
+      scanCode: scanCode,
+      skuName: skuName,
+      jpegBytes: jpegBytes,
+      source: source,
+      department: department,
+    );
+
+    if (!mounted) return;
+    if (result.outcome == EnrollmentOutcome.enrolled) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            result.message ?? 'Saved appearance for $scanCode',
+          ),
+          duration: const Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: Colors.teal.shade800,
+        ),
+      );
+    } else if (result.outcome == EnrollmentOutcome.partialLan) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            result.message ??
+                'Saved on phone only — LAN failed. ✨ needs sandbox.',
+          ),
+          duration: const Duration(seconds: 4),
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: Colors.orange.shade800,
+        ),
+      );
+    } else if (result.outcome == EnrollmentOutcome.skippedQuality) {
+      _showFusionSnack(
+        result.message ?? 'Crop too blurry/small — hold face steady and retry',
+      );
+    } else if (result.outcome == EnrollmentOutcome.skippedAtCap) {
+      _showFusionSnack(result.message ?? 'Appearance view cap reached');
+    } else {
+      debugPrint(
+        '[LiveScan] enroll $scanCode → ${result.outcome} ${result.message}',
+      );
+      _showFusionSnack(result.message ?? 'Could not save appearance');
+    }
+  }
+
+  Future<Uint8List?> _captureEnrollCrop() async {
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) return null;
+    try {
+      final wasStreaming = controller.value.isStreamingImages;
+      if (wasStreaming) {
+        try {
+          await controller.stopImageStream();
+        } catch (_) {}
+      }
+      final XFile shot = await controller.takePicture();
+      final fullBytes = await File(shot.path).readAsBytes();
+      final crop = centerCropBottleJpeg(fullBytes);
+      if (wasStreaming &&
+          _cameraController != null &&
+          _cameraController!.value.isInitialized &&
+          !_cameraController!.value.isStreamingImages) {
+        try {
+          await _cameraController!.startImageStream(_onCameraImage);
+        } catch (_) {}
+      }
+      return crop?.jpegBytes;
+    } catch (e) {
+      debugPrint('[LiveScan] enroll capture failed: $e');
+      try {
+        if (_cameraController != null &&
+            _cameraController!.value.isInitialized &&
+            !_cameraController!.value.isStreamingImages) {
+          await _cameraController!.startImageStream(_onCameraImage);
+        }
+      } catch (_) {}
+      return null;
+    }
   }
 
   Widget _buildCameraPreview(CameraController controller) {
@@ -859,7 +1099,8 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     final controller = _cameraController;
     final hasCard = _currentProduct != null ||
         _isUnknownProduct ||
-        _visualPickerCandidates != null;
+        _visualPickerCandidates != null ||
+        _showUnknownVisualCard;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -1021,16 +1262,19 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                       child: FadeTransition(opacity: anim, child: child),
                     ),
                     child: hasCard
-                        ? (_visualPickerCandidates != null
-                            ? _buildVisualPickerCard(_visualPickerCandidates!)
-                            : (_currentProduct != null
-                                ? _buildProductCard(_currentProduct!)
-                                : (_unknownPhase ==
-                                        _UnknownSheetPhase.miniForm
-                                    ? _buildUnknownMiniForm(
-                                        _detectedCode ?? '')
-                                    : _buildUnknownPrompt(
-                                        _detectedCode ?? ''))))
+                        ? (_showUnknownVisualCard
+                            ? _buildUnknownVisualCard()
+                            : (_visualPickerCandidates != null
+                                ? _buildVisualPickerCard(
+                                    _visualPickerCandidates!)
+                                : (_currentProduct != null
+                                    ? _buildProductCard(_currentProduct!)
+                                    : (_unknownPhase ==
+                                            _UnknownSheetPhase.miniForm
+                                        ? _buildUnknownMiniForm(
+                                            _detectedCode ?? '')
+                                        : _buildUnknownPrompt(
+                                            _detectedCode ?? '')))))
                         : _buildBottomHint(),
                     ),
                   ),
@@ -1478,6 +1722,46 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       );
     }
 
+    if (_awaitingBarcodeForEnroll) {
+      return Container(
+        key: const ValueKey('await-barcode-enroll'),
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        decoration: BoxDecoration(
+          color: Colors.teal.shade900.withValues(alpha: 0.92),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(
+          children: [
+            Icon(Icons.qr_code_scanner, color: Colors.teal.shade100, size: 20),
+            const SizedBox(width: 10),
+            const Expanded(
+              child: Text(
+                'Scan barcode to link appearance to Excel',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            TextButton(
+              onPressed: () {
+                setState(() {
+                  _awaitingBarcodeForEnroll = false;
+                  _pendingEnrollCrop = null;
+                });
+              },
+              child: Text(
+                'Cancel',
+                style: TextStyle(color: Colors.teal.shade100, fontSize: 12),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     return Container(
       key: const ValueKey('idle'),
       margin: const EdgeInsets.fromLTRB(16, 0, 16, 24),
@@ -1497,6 +1781,78 @@ class _LiveScanScreenState extends State<LiveScanScreen>
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// ✨ open-set unknown — Excel product may exist; gallery has no confident hit.
+  Widget _buildUnknownVisualCard() {
+    return Container(
+      key: const ValueKey('unknown-visual'),
+      margin: const EdgeInsets.fromLTRB(6, 0, 6, 4),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.28),
+            blurRadius: 22,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.visibility_off, color: Colors.orange.shade800, size: 20),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'No visual match',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 15,
+                      color: _navy,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  tooltip: 'Dismiss',
+                  onPressed: _dismissUnknownVisualCard,
+                  icon: const Icon(Icons.close),
+                ),
+              ],
+            ),
+            Text(
+              'This look is not in the visual gallery yet. '
+              'If the product is in Excel, save its appearance after scanning the barcode.',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              height: 46,
+              child: ElevatedButton.icon(
+                onPressed: _beginBarcodeLinkForEnroll,
+                icon: const Icon(Icons.face_retouching_natural, size: 20),
+                label: const Text('Save appearance'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.teal.shade700,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  textStyle: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1623,6 +1979,17 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                 ),
               );
             }),
+            TextButton(
+              onPressed: _beginBarcodeLinkForEnroll,
+              child: Text(
+                'None of these — Save appearance',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.teal.shade800,
+                ),
+              ),
+            ),
           ],
         ),
       ),
@@ -1855,10 +2222,79 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                 }
               },
             ),
+            if (scanCode.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                height: 44,
+                child: OutlinedButton.icon(
+                  onPressed: _savingAppearance
+                      ? null
+                      : () => unawaited(_saveAppearanceForLockedProduct()),
+                  icon: _savingAppearance
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : Icon(
+                          Icons.face_retouching_natural,
+                          size: 18,
+                          color: Colors.teal.shade800,
+                        ),
+                  label: Text(
+                    _savingAppearance ? 'Saving appearance…' : 'Save appearance',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      color: Colors.teal.shade900,
+                    ),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    side: BorderSide(color: Colors.teal.shade300),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: _savingAppearance
+                      ? null
+                      : () => unawaited(_forgetAppearance(scanCode)),
+                  child: Text(
+                    'Forget appearance',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey.shade600,
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),
     ),
+    );
+  }
+
+  Future<void> _forgetAppearance(String scanCode) async {
+    final n = await _enrollment.forgetAppearance(scanCode);
+    // Local only — LAN seed gallery is not wiped from the phone.
+    debugPrint('[LiveScan] forgot $n local embedding(s) for $scanCode');
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          n > 0
+              ? 'Cleared local appearance for $scanCode'
+              : 'No local appearance stored for $scanCode',
+        ),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+      ),
     );
   }
 

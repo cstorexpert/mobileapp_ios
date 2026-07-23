@@ -50,6 +50,10 @@ class FusionResult {
 
   bool get isSuccess => status == 'success';
 
+  /// Open-set reject from sandbox — no claimed gallery winner.
+  /// top_k may still list nearest neighbors for Excel mapping.
+  bool get isUnknownGallery => resolutionStatus == 'unknown';
+
   factory FusionResult.fromJson(Map<String, dynamic> json) {
     final topRaw = json['top_k'];
     final topK = <FusionCandidate>[];

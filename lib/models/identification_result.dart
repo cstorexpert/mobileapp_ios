@@ -65,12 +65,33 @@ class IdentificationResult {
           band == VisualConfidenceBand.medium) &&
       candidates.isNotEmpty;
 
+  /// Sandbox open-set reject or app low band — offer Save appearance.
+  bool get isUnknownVisual =>
+      (raw?.isUnknownGallery ?? false) ||
+      (source == IdentificationSource.none &&
+          band == VisualConfidenceBand.low &&
+          (raw?.isSuccess ?? false));
+
   factory IdentificationResult.none({String? message, FusionResult? raw}) {
     return IdentificationResult(
       source: IdentificationSource.none,
       band: VisualConfidenceBand.low,
       candidates: const [],
       message: message,
+      raw: raw,
+    );
+  }
+
+  factory IdentificationResult.unknown({
+    String? message,
+    FusionResult? raw,
+    List<VisualCandidate> candidates = const [],
+  }) {
+    return IdentificationResult(
+      source: IdentificationSource.none,
+      band: VisualConfidenceBand.low,
+      candidates: candidates,
+      message: message ?? 'No visual match in gallery',
       raw: raw,
     );
   }

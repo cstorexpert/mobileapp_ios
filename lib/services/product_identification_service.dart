@@ -67,14 +67,22 @@ class ProductIdentificationService {
       );
     }
 
+    // Always map top_k → Excel first. Server may mark open-set "unknown" and
+    // clear the winner, but top_k still lists gallery hits (incl. enrolled SKUs).
     final mapped = _mapInSheetCandidates(raw, previousStock);
+    debugPrint(
+      '[ProductID] fuse status=${raw.resolutionStatus} '
+      'conf=${raw.confidence.toStringAsFixed(3)} '
+      'winner=${raw.scanCode.isEmpty ? "(none)" : raw.scanCode} '
+      'mapped=${mapped.length} '
+      'top=${mapped.isEmpty ? "-" : "${mapped.first.scanCode}@${mapped.first.score.toStringAsFixed(3)}"}',
+    );
+
     if (mapped.isEmpty) {
-      debugPrint(
-        '[ProductID] fuse ok but no Excel-mapped candidates '
-        '(winner=${raw.scanCode} conf=${raw.confidence.toStringAsFixed(3)})',
-      );
-      return IdentificationResult.none(
-        message: 'No Excel match for visual candidates',
+      return IdentificationResult.unknown(
+        message: raw.isUnknownGallery
+            ? (raw.message ?? 'No visual match in gallery')
+            : 'No Excel match for visual candidates',
         raw: raw,
       );
     }
@@ -88,21 +96,23 @@ class ProductIdentificationService {
     );
 
     if (band == VisualConfidenceBand.low) {
-      return IdentificationResult(
-        source: IdentificationSource.none,
-        band: band,
-        candidates: mapped,
+      return IdentificationResult.unknown(
         message: 'Visual confidence too low',
         raw: raw,
+        candidates: mapped.take(3).toList(),
       );
     }
 
+    // Usable Excel-mapped hit — show picker/card even if server said unknown.
     return IdentificationResult(
       source: IdentificationSource.visual,
       band: band,
       scanCode: mapped.first.scanCode,
       candidates: mapped.take(3).toList(),
       raw: raw,
+      message: raw.isUnknownGallery
+          ? 'Gallery open-set was weak; showing Excel-mapped candidates'
+          : null,
     );
   }
 

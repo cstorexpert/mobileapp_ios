@@ -102,4 +102,81 @@ class FusionApiService {
       return null;
     }
   }
+
+  /// Registers / appends a reference crop under [scanCode] on the LAN sandbox.
+  /// When [append] is true, existing gallery views are kept (Phase 3 multi-view).
+  Future<RegisterSkuResult> registerSku({
+    required String scanCode,
+    required String skuName,
+    required String prompt,
+    required Uint8List jpegBytes,
+    String keywords = '',
+    String department = '',
+    bool append = true,
+  }) async {
+    try {
+      final form = FormData.fromMap({
+        'scan_code': scanCode,
+        'sku_name': skuName,
+        'excel_name': skuName,
+        'prompt': prompt,
+        'keywords': keywords,
+        'department': department,
+        'append': append ? 'true' : 'false',
+        'files': MultipartFile.fromBytes(jpegBytes, filename: 'enroll.jpg'),
+      });
+      final res = await _dio.post(
+        '${_baseUrl}api/register_sku',
+        data: form,
+        options: Options(contentType: 'multipart/form-data'),
+      );
+      final data = res.data;
+      if (data is Map) {
+        final status = data['status']?.toString() ?? '';
+        if (status == 'success' || status == 'skipped') {
+          return RegisterSkuResult(
+            success: status == 'success',
+            skipped: status == 'skipped',
+            scanCode: data['scan_code']?.toString() ?? scanCode,
+            message: data['message']?.toString(),
+            imagesProcessed: (data['images_processed'] as num?)?.toInt() ?? 0,
+            viewCount: (data['view_count'] as num?)?.toInt(),
+          );
+        }
+        return RegisterSkuResult(
+          success: false,
+          message: data['message']?.toString() ?? 'register_sku failed',
+        );
+      }
+      return const RegisterSkuResult(
+        success: false,
+        message: 'Unexpected register_sku response',
+      );
+    } on DioException catch (e) {
+      return RegisterSkuResult(
+        success: false,
+        message: e.message ?? e.toString(),
+      );
+    } catch (e) {
+      return RegisterSkuResult(success: false, message: e.toString());
+    }
+  }
+}
+
+class RegisterSkuResult {
+  const RegisterSkuResult({
+    required this.success,
+    this.skipped = false,
+    this.scanCode,
+    this.message,
+    this.imagesProcessed = 0,
+    this.viewCount,
+  });
+
+  final bool success;
+  final bool skipped;
+  final String? scanCode;
+  final String? message;
+  final int imagesProcessed;
+  final int? viewCount;
 }
