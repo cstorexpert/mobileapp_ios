@@ -16,6 +16,13 @@ enum EnrollmentOutcome {
   partialLan, // local ok, LAN failed (still useful for Phase 5)
 }
 
+enum ForgetOutcome {
+  clearedBoth,
+  clearedLocalOnly,
+  nothingLocal,
+  failed,
+}
+
 class EnrollmentResult {
   const EnrollmentResult({
     required this.outcome,
@@ -36,6 +43,20 @@ class EnrollmentResult {
   bool get didStoreLan =>
       outcome == EnrollmentOutcome.enrolled ||
       (lanViewCount != null && lanViewCount! > 0);
+}
+
+class ForgetResult {
+  const ForgetResult({
+    required this.outcome,
+    this.message,
+    this.localDeleted = 0,
+    this.lanCleared = false,
+  });
+
+  final ForgetOutcome outcome;
+  final String? message;
+  final int localDeleted;
+  final bool lanCleared;
 }
 
 /// Face-forward Save appearance: quality-gate → local SQLite → LAN register.
@@ -72,7 +93,8 @@ class ProductEnrollmentService {
       return EnrollmentResult(
         outcome: EnrollmentOutcome.skippedAtCap,
         message:
-            'Already have ${ProductEmbeddingRepository.maxViewsPerScanCode} local views',
+            'Already have ${ProductEmbeddingRepository.maxViewsPerScanCode} local views. '
+            'Tap Forget appearance to replace.',
         localCount: await _repo.countForScanCode(code),
       );
     }
@@ -158,7 +180,7 @@ class ProductEnrollmentService {
       return EnrollmentResult(
         outcome: EnrollmentOutcome.enrolled,
         message: lanSkipped
-            ? 'Appearance already on LAN ($views views)'
+            ? 'Appearance already on LAN ($views views). Forget to replace.'
             : 'Saved appearance on LAN ($views views)',
         localCount: localCount,
         lanViewCount: lanViews,
@@ -185,6 +207,60 @@ class ProductEnrollmentService {
     );
   }
 
-  Future<int> forgetAppearance(String scanCode) =>
-      _repo.deleteForScanCode(scanCode.trim());
+  /// Clears local SQLite views and, when reachable, LAN gallery for [scanCode].
+  Future<ForgetResult> forgetAppearance(String scanCode) async {
+    final code = scanCode.trim();
+    if (code.isEmpty) {
+      return const ForgetResult(
+        outcome: ForgetOutcome.failed,
+        message: 'empty scan_code',
+      );
+    }
+
+    final localDeleted = await _repo.deleteForScanCode(code);
+    var lanCleared = false;
+    String? lanMessage;
+
+    if (_fusionApi.baseUrl.isNotEmpty) {
+      final lan = await _fusionApi.forgetSku(code);
+      lanCleared = lan.success;
+      lanMessage = lan.message;
+      debugPrint(
+        '[Enroll] forget_sku success=${lan.success} '
+        'removed=${lan.removedViews} msg=${lan.message}',
+      );
+    } else {
+      lanMessage = 'fusionBaseUrl empty';
+    }
+
+    if (lanCleared) {
+      return ForgetResult(
+        outcome: ForgetOutcome.clearedBoth,
+        message: localDeleted > 0
+            ? 'Cleared local + LAN appearance for $code'
+            : 'Cleared LAN appearance for $code',
+        localDeleted: localDeleted,
+        lanCleared: true,
+      );
+    }
+
+    if (localDeleted > 0) {
+      return ForgetResult(
+        outcome: ForgetOutcome.clearedLocalOnly,
+        message:
+            'Cleared local appearance for $code — LAN not cleared '
+            '(${lanMessage ?? "unreachable"}). Check Wi‑Fi / sandbox.',
+        localDeleted: localDeleted,
+        lanCleared: false,
+      );
+    }
+
+    return ForgetResult(
+      outcome: ForgetOutcome.nothingLocal,
+      message: 'No local appearance for $code'
+          '${lanMessage != null && _fusionApi.baseUrl.isNotEmpty ? " — LAN: $lanMessage" : ""}',
+      localDeleted: 0,
+      lanCleared: false,
+    );
+  }
 }

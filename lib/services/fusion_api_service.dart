@@ -12,7 +12,9 @@ class FusionApiService {
         _dio = dio ??
             Dio(
               BaseOptions(
-                connectTimeout: const Duration(seconds: 8),
+                // Phase 4: unified defaults. Identify uses a shorter Dio via
+                // ProductIdentificationService; enroll keeps longer receive.
+                connectTimeout: const Duration(seconds: 5),
                 receiveTimeout: const Duration(seconds: 45),
                 sendTimeout: const Duration(seconds: 45),
               ),
@@ -161,6 +163,38 @@ class FusionApiService {
       return RegisterSkuResult(success: false, message: e.toString());
     }
   }
+
+  /// Clears LAN gallery views for [scanCode] (Phase 4 wrong-enroll recovery).
+  Future<ForgetSkuResult> forgetSku(String scanCode) async {
+    try {
+      final form = FormData.fromMap({'scan_code': scanCode});
+      final res = await _dio.post(
+        '${_baseUrl}api/forget_sku',
+        data: form,
+        options: Options(contentType: 'multipart/form-data'),
+      );
+      final data = res.data;
+      if (data is Map && data['status']?.toString() == 'success') {
+        return ForgetSkuResult(
+          success: true,
+          scanCode: data['scan_code']?.toString() ?? scanCode,
+          message: data['message']?.toString(),
+          removedViews: (data['removed_views'] as num?)?.toInt() ?? 0,
+          hadGallery: data['had_gallery'] == true,
+        );
+      }
+      return ForgetSkuResult(
+        success: false,
+        message: data is Map
+            ? (data['message']?.toString() ?? 'forget_sku failed')
+            : 'Unexpected forget_sku response',
+      );
+    } on DioException catch (e) {
+      return ForgetSkuResult(success: false, message: e.message ?? e.toString());
+    } catch (e) {
+      return ForgetSkuResult(success: false, message: e.toString());
+    }
+  }
 }
 
 class RegisterSkuResult {
@@ -179,4 +213,20 @@ class RegisterSkuResult {
   final String? message;
   final int imagesProcessed;
   final int? viewCount;
+}
+
+class ForgetSkuResult {
+  const ForgetSkuResult({
+    required this.success,
+    this.scanCode,
+    this.message,
+    this.removedViews = 0,
+    this.hadGallery = false,
+  });
+
+  final bool success;
+  final String? scanCode;
+  final String? message;
+  final int removedViews;
+  final bool hadGallery;
 }

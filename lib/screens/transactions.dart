@@ -2184,6 +2184,7 @@ class _StockManagementScreenState extends State<StockManagementScreen>
         int loadedCount = 0;
         int skippedCount = 0;
         int failedCount = 0;
+        int duplicateScanCodeCount = 0;
 
         // Resilient cell extractors. Any failure inside the excel package
         // (e.g. unexpected CellValue subtype) returns a safe default instead
@@ -2261,6 +2262,9 @@ class _StockManagementScreenState extends State<StockManagementScreen>
                 final quantity = _cellAsInt(row[5]);
 
                 if (scanCode.isNotEmpty && itemCode.isNotEmpty) {
+                  if (previousStock.containsKey(scanCode)) {
+                    duplicateScanCodeCount++;
+                  }
                   previousStock[scanCode] = StockItem(
                     scanCode: scanCode,
                     code: itemCode,
@@ -2312,15 +2316,19 @@ class _StockManagementScreenState extends State<StockManagementScreen>
         
         if (mounted) {
           final hasIssues = skippedCount > 0 || failedCount > 0;
+          final dupNote = duplicateScanCodeCount > 0
+              ? ' ($duplicateScanCodeCount duplicate scan codes; last row kept)'
+              : '';
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text(
                 hasIssues
-                    ? '$loadedCount items loaded ($skippedCount skipped, $failedCount errors)'
-                    : 'Excel uploaded! $loadedCount items loaded.',
+                    ? '$loadedCount items loaded ($skippedCount skipped, $failedCount errors)$dupNote'
+                    : 'Excel uploaded! $loadedCount items loaded.$dupNote',
               ),
-              backgroundColor: Colors.green,
-              duration: const Duration(seconds: 3),
+              backgroundColor:
+                  duplicateScanCodeCount > 0 ? Colors.orange.shade800 : Colors.green,
+              duration: const Duration(seconds: 4),
             ),
           );
         }

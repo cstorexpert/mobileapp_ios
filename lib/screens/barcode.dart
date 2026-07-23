@@ -198,6 +198,7 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
         
         int itemsProcessed = 0;
         int totalItems = 0;
+        int duplicateScanCodeCount = 0;
         
         String cellAsString(dynamic cell) {
           final cellValue = cell?.value;
@@ -267,7 +268,10 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
                     itemCode.isNotEmpty && 
                     department.toLowerCase() == widget.allocatedSection.toLowerCase()) {
                   
-                  // Store with scanCode as key
+                  // Store with scanCode as key (last row wins on duplicates)
+                  if (previousStock.containsKey(scanCode)) {
+                    duplicateScanCodeCount++;
+                  }
                   previousStock[scanCode] = StockItem(
                     scanCode: scanCode,
                     code: itemCode,
@@ -304,11 +308,17 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
         
         // Show success message
         if (mounted) {
+          final dupNote = duplicateScanCodeCount > 0
+              ? ' ($duplicateScanCodeCount duplicate scan codes; last row kept)'
+              : '';
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Excel file uploaded successfully! ${previousStock.length} items loaded for ${widget.allocatedSection}.'),
-              backgroundColor: Colors.green,
-              duration: Duration(seconds: 3),
+              content: Text(
+                'Excel file uploaded successfully! ${previousStock.length} items loaded for ${widget.allocatedSection}.$dupNote',
+              ),
+              backgroundColor:
+                  duplicateScanCodeCount > 0 ? Colors.orange.shade800 : Colors.green,
+              duration: Duration(seconds: 4),
             ),
           );
         }

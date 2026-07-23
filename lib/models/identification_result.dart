@@ -6,8 +6,7 @@ enum IdentificationSource { barcode, ocr, visual, none }
 
 /// How strongly to trust a visual (MobileCLIP) match in the UI.
 ///
-/// Thresholds are intentionally lenient for LAN phone crops (~0.45–0.55).
-/// Phase 4 will recalibrate from a device matrix.
+/// Thresholds live in [FusionThresholds] / fusion_thresholds.json (Phase 4).
 enum VisualConfidenceBand {
   /// Strong top-1 + margin → single suggested product (still requires ADD).
   high,
@@ -15,7 +14,7 @@ enum VisualConfidenceBand {
   /// Typical phone scores → show top-k picker.
   medium,
 
-  /// Too weak / no Excel-mapped candidates → do not claim a product.
+  /// Weak but above floor → still show top-k picker (labeled weak); below floor → no claim.
   low,
 }
 
@@ -60,10 +59,7 @@ class IdentificationResult {
   final FusionResult? raw;
 
   bool get hasVisualClaim =>
-      source == IdentificationSource.visual &&
-      (band == VisualConfidenceBand.high ||
-          band == VisualConfidenceBand.medium) &&
-      candidates.isNotEmpty;
+      source == IdentificationSource.visual && candidates.isNotEmpty;
 
   /// Sandbox open-set reject or app low band — offer Save appearance.
   bool get isUnknownVisual =>

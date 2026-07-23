@@ -2,6 +2,8 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as img;
 
+import 'package:countx/config/fusion_thresholds.dart';
+
 /// Simple blur / size gates for Phase 3 enrollment crops.
 class CropQualityResult {
   const CropQualityResult({
@@ -22,9 +24,9 @@ class CropQualityResult {
 /// Rejects tiny or very blurry JPEGs before we spend LAN / SQLite on them.
 CropQualityResult assessCropJpeg(
   Uint8List jpegBytes, {
-  int minSide = 64,
-  int minBytes = 1500,
-  double minLaplacianVariance = 25.0,
+  int minSide = FusionThresholds.minSide,
+  int minBytes = FusionThresholds.minBytes,
+  double minLaplacianVariance = FusionThresholds.minLaplacianVariance,
 }) {
   if (jpegBytes.length < minBytes) {
     return const CropQualityResult(

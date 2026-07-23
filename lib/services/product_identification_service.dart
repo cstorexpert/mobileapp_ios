@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart' show debugPrint;
 
+import 'package:countx/config/fusion_thresholds.dart';
 import 'package:countx/models/fusion_result.dart';
 import 'package:countx/models/identification_result.dart';
 import 'package:countx/screens/transactions.dart' show StockItem;
@@ -18,10 +19,10 @@ class ProductIdentificationService {
             FusionApiService(
               dio: Dio(
                 BaseOptions(
-                  // Cascade must fail faster than the debug Test Fusion path.
+                  // Identify path: fail fast so Live Scan stays responsive.
                   connectTimeout: const Duration(seconds: 5),
-                  receiveTimeout: const Duration(seconds: 18),
-                  sendTimeout: const Duration(seconds: 18),
+                  receiveTimeout: const Duration(seconds: 20),
+                  sendTimeout: const Duration(seconds: 20),
                 ),
               ),
             );
@@ -30,15 +31,11 @@ class ProductIdentificationService {
 
   FusionApiService get fusionApi => _fusionApi;
 
-  /// Phone LAN crops often land ~0.45–0.55; keep high rare, medium as default UX.
-  static const double highScoreThreshold = 0.70;
-  static const double highMarginThreshold = 0.08;
-
-  /// Show top-k picker at/above this (covers typical ~0.50 demos).
-  static const double mediumScoreThreshold = 0.38;
-
-  /// Below this → no visual claim.
-  static const double lowScoreFloor = 0.30;
+  /// Mirrors [FusionThresholds] for tests / callers that import this class.
+  static const double highScoreThreshold = FusionThresholds.highScore;
+  static const double highMarginThreshold = FusionThresholds.highMargin;
+  static const double mediumScoreThreshold = FusionThresholds.mediumScore;
+  static const double lowScoreFloor = FusionThresholds.lowScoreFloor;
 
   /// Runs `/api/fuse` on a center crop and maps winners to Excel rows only.
   Future<IdentificationResult> identifyFromCrop({
@@ -95,11 +92,23 @@ class ProductIdentificationService {
       rawConfidence: raw.confidence,
     );
 
-    if (band == VisualConfidenceBand.low) {
+    // Absolute floor: no claim at all.
+    if (mapped.first.score < lowScoreFloor) {
       return IdentificationResult.unknown(
         message: 'Visual confidence too low',
         raw: raw,
+      );
+    }
+
+    // Phase 4: low band still offers a weak top-3 picker (not "No visual match").
+    if (band == VisualConfidenceBand.low) {
+      return IdentificationResult(
+        source: IdentificationSource.visual,
+        band: VisualConfidenceBand.low,
+        scanCode: mapped.first.scanCode,
         candidates: mapped.take(3).toList(),
+        raw: raw,
+        message: 'Weak visual match — pick carefully or save appearance',
       );
     }
 

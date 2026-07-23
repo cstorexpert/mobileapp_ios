@@ -128,6 +128,9 @@ class _LiveScanScreenState extends State<LiveScanScreen>
   FusionResult? _fusionDebugResult;
   List<VisualCandidate>? _visualPickerCandidates;
 
+  /// Weak-band picker (Phase 4) — show caution label in picker header.
+  bool _visualPickerWeak = false;
+
   /// Face crop from ✨ (or capture) for Save appearance after barcode link.
   Uint8List? _pendingEnrollCrop;
 
@@ -138,6 +141,9 @@ class _LiveScanScreenState extends State<LiveScanScreen>
   bool _awaitingBarcodeForEnroll = false;
 
   bool _savingAppearance = false;
+
+  /// Phase 4: sandbox unreachable — banner only; barcode/OCR keep running.
+  bool _fusionOffline = false;
 
   /// True while the quantity / unknown / visual-picker overlay is active.
   bool get _isInputting =>
@@ -163,6 +169,17 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       duration: const Duration(milliseconds: 1000),
     );
     unawaited(_initCamera());
+    unawaited(_refreshFusionHealth());
+  }
+
+  Future<void> _refreshFusionHealth() async {
+    if (AppConfig.fusionBaseUrl.isEmpty) {
+      if (mounted) setState(() => _fusionOffline = true);
+      return;
+    }
+    final ok = await _productId.fusionApi.healthCheck();
+    if (!mounted) return;
+    setState(() => _fusionOffline = !ok);
   }
 
   Future<void> _initCamera() async {
@@ -283,6 +300,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
   Future<void> _runFusionIdentify() async {
     if (_fusionBusy) return;
     if (AppConfig.fusionBaseUrl.isEmpty) {
+      setState(() => _fusionOffline = true);
       _showFusionSnack('fusionBaseUrl is empty in config.dart');
       return;
     }
@@ -292,10 +310,25 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       return;
     }
 
+    // Pre-flight health so we fail fast with a clear offline message.
+    final healthy = await _productId.fusionApi.healthCheck();
+    if (!mounted) return;
+    if (!healthy) {
+      setState(() => _fusionOffline = true);
+      _showFusionSnack(
+        'Visual match offline — is the sandbox running at ${AppConfig.fusionBaseUrl}?',
+      );
+      return;
+    }
+    if (_fusionOffline) {
+      setState(() => _fusionOffline = false);
+    }
+
     setState(() {
       _fusionBusy = true;
       _fusionDebugResult = null;
       _visualPickerCandidates = null;
+      _visualPickerWeak = false;
       _showUnknownVisualCard = false;
     });
 
@@ -327,7 +360,8 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       if (!result.hasVisualClaim) {
         final raw = result.raw;
         if (raw != null && !raw.isSuccess) {
-          setState(() => _fusionDebugResult = raw);
+          // Phase 4: snack only — do not block barcode/OCR with debug overlay.
+          setState(() => _fusionOffline = true);
           _showFusionSnack(raw.message ?? 'Fusion failed');
           return;
         }
@@ -335,7 +369,6 @@ class _LiveScanScreenState extends State<LiveScanScreen>
         debugPrint('[LiveScan] ✨ UNKNOWN visual — Save appearance offered');
         setState(() {
           _showUnknownVisualCard = true;
-          _fusionDebugResult = raw;
         });
         return;
       }
@@ -356,15 +389,19 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       }
 
       final picks = result.candidates.take(3).toList();
+      final weak = result.band == VisualConfidenceBand.low;
       debugPrint(
-        '[LiveScan] ✨ MEDIUM → picker ${picks.length} '
+        '[LiveScan] ✨ ${weak ? "WEAK" : "MEDIUM"} → picker ${picks.length} '
         'top=${picks.first.scanCode} ${picks.first.score.toStringAsFixed(3)}',
       );
-      setState(() => _visualPickerCandidates = picks);
+      setState(() {
+        _visualPickerCandidates = picks;
+        _visualPickerWeak = weak;
+      });
     } catch (e) {
       debugPrint('[LiveScan] ✨ fusion error: $e');
       if (mounted) {
-        setState(() => _fusionDebugResult = FusionResult.error(e.toString()));
+        setState(() => _fusionOffline = true);
         _showFusionSnack(
           'Fusion failed. Is the sandbox running at ${AppConfig.fusionBaseUrl}?',
         );
@@ -401,16 +438,14 @@ class _LiveScanScreenState extends State<LiveScanScreen>
 
   Future<void> _processCameraImage(CameraImage image) async {
     // Traditional Live Scan: barcode → OCR only.
-    // Pause while ✨ fusion is running, debug overlay is open, or qty/unknown
-    // card is locked. Visual picker (from ✨) stays open to camera so barcode
-    // can still win.
+    // Pause while ✨ fusion is running or qty/unknown card is locked.
+    // Do not pause for fusion offline banner — barcode must keep working.
     final lockedOnCard = _lockPhase == _LockPhase.locked &&
         (_currentProduct != null || _isUnknownProduct);
     if (!mounted ||
         _processingVision ||
         lockedOnCard ||
-        _fusionBusy ||
-        _fusionDebugResult != null) {
+        _fusionBusy) {
       return;
     }
     final pickerOpen = _visualPickerCandidates != null;
@@ -509,7 +544,10 @@ class _LiveScanScreenState extends State<LiveScanScreen>
 
   void _dismissVisualPicker() {
     if (!mounted) return;
-    setState(() => _visualPickerCandidates = null);
+    setState(() {
+      _visualPickerCandidates = null;
+      _visualPickerWeak = false;
+    });
   }
 
   void _dismissUnknownVisualCard() {
@@ -523,7 +561,10 @@ class _LiveScanScreenState extends State<LiveScanScreen>
   void _onVisualCandidatePicked(VisualCandidate c) {
     final code = c.scanCode;
     if (code.isEmpty) return;
-    setState(() => _visualPickerCandidates = null);
+    setState(() {
+      _visualPickerCandidates = null;
+      _visualPickerWeak = false;
+    });
     _handleCodeRead(code, sourceBarcode: false, itemSource: 'visual');
   }
 
@@ -1176,6 +1217,53 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                 ),
               ),
               _buildTopBar(context),
+              if (_fusionOffline)
+                Positioned(
+                  left: 12,
+                  right: 12,
+                  top: mq.padding.top + 52,
+                  child: Material(
+                    color: Colors.orange.shade900.withValues(alpha: 0.94),
+                    borderRadius: BorderRadius.circular(12),
+                    elevation: 2,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(
+                            Icons.cloud_off,
+                            color: Colors.white,
+                            size: 18,
+                          ),
+                          const SizedBox(width: 8),
+                          const Expanded(
+                            child: Text(
+                              'Visual match offline — barcode/OCR still work',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                          TextButton(
+                            onPressed: () => unawaited(_refreshFusionHealth()),
+                            style: TextButton.styleFrom(
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 8),
+                              minimumSize: Size.zero,
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                            child: const Text('Retry', style: TextStyle(fontSize: 12)),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
               if (_fusionBusy)
                 const Positioned.fill(
                   child: ColoredBox(
@@ -1883,12 +1971,22 @@ class _LiveScanScreenState extends State<LiveScanScreen>
           children: [
             Row(
               children: [
-                Icon(Icons.auto_awesome, color: Colors.teal.shade700, size: 20),
+                Icon(
+                  _visualPickerWeak
+                      ? Icons.warning_amber_rounded
+                      : Icons.auto_awesome,
+                  color: _visualPickerWeak
+                      ? Colors.orange.shade800
+                      : Colors.teal.shade700,
+                  size: 20,
+                ),
                 const SizedBox(width: 8),
-                const Expanded(
+                Expanded(
                   child: Text(
-                    'Select matching product',
-                    style: TextStyle(
+                    _visualPickerWeak
+                        ? 'Weak match — pick carefully'
+                        : 'Select matching product',
+                    style: const TextStyle(
                       fontWeight: FontWeight.w800,
                       fontSize: 15,
                       color: _navy,
@@ -1904,7 +2002,9 @@ class _LiveScanScreenState extends State<LiveScanScreen>
               ],
             ),
             Text(
-              'Visual match — confirm before adding',
+              _visualPickerWeak
+                  ? 'Low confidence — confirm or save appearance'
+                  : 'Visual match — confirm before adding',
               style: TextStyle(
                 fontSize: 12,
                 color: Colors.grey.shade700,
@@ -2281,19 +2381,19 @@ class _LiveScanScreenState extends State<LiveScanScreen>
   }
 
   Future<void> _forgetAppearance(String scanCode) async {
-    final n = await _enrollment.forgetAppearance(scanCode);
-    // Local only — LAN seed gallery is not wiped from the phone.
-    debugPrint('[LiveScan] forgot $n local embedding(s) for $scanCode');
+    final result = await _enrollment.forgetAppearance(scanCode);
+    debugPrint(
+      '[LiveScan] forget $scanCode → ${result.outcome} '
+      'local=${result.localDeleted} lan=${result.lanCleared}',
+    );
     if (!mounted) return;
+    final orange = result.outcome == ForgetOutcome.clearedLocalOnly;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(
-          n > 0
-              ? 'Cleared local appearance for $scanCode'
-              : 'No local appearance stored for $scanCode',
-        ),
-        duration: const Duration(seconds: 2),
+        content: Text(result.message ?? 'Forget appearance done'),
+        duration: Duration(seconds: orange ? 4 : 2),
         behavior: SnackBarBehavior.floating,
+        backgroundColor: orange ? Colors.orange.shade800 : null,
       ),
     );
   }
