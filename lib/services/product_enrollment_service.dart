@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show debugPrint;
 
 import 'package:countx/services/fusion_api_service.dart';
+import 'package:countx/services/mobileclip_onnx_service.dart';
 import 'package:countx/services/product_embedding_repository.dart';
 import 'package:countx/utils/crop_quality.dart';
 
@@ -13,7 +14,7 @@ enum EnrollmentOutcome {
   skippedNoScanCode,
   failedLocal,
   failedLan,
-  partialLan, // local ok, LAN failed (still useful for Phase 5)
+  partialLan, // local ok, LAN failed (LAN mode only)
 }
 
 enum ForgetOutcome {
@@ -59,18 +60,21 @@ class ForgetResult {
   final bool lanCleared;
 }
 
-/// Face-forward Save appearance: quality-gate → local SQLite → LAN register.
+/// Face-forward Save appearance: quality-gate → embed → local SQLite (+ LAN when set).
 ///
 /// Never called on unconfirmed CLIP suggestions.
 class ProductEnrollmentService {
   ProductEnrollmentService({
     FusionApiService? fusionApi,
     ProductEmbeddingRepository? repository,
+    MobileClipOnnxService? onnx,
   })  : _fusionApi = fusionApi ?? FusionApiService(),
-        _repo = repository ?? ProductEmbeddingRepository.instance;
+        _repo = repository ?? ProductEmbeddingRepository.instance,
+        _onnx = onnx ?? MobileClipOnnxService();
 
   final FusionApiService _fusionApi;
   final ProductEmbeddingRepository _repo;
+  final MobileClipOnnxService _onnx;
 
   /// [source] is Live Scan item source: scanner | visual | manual | ocr.
   Future<EnrollmentResult> enrollAfterConfirm({
@@ -110,24 +114,39 @@ class ProductEnrollmentService {
 
     final display = skuName.trim().isEmpty ? code : skuName.trim();
     final prompt = 'A product photo of $display';
+    final lanMode = _fusionApi.baseUrl.isNotEmpty;
 
     debugPrint(
       '[Enroll] start $code name="$display" bytes=${jpegBytes.length} '
       'quality=${quality.laplacianVariance.toStringAsFixed(1)} '
-      'size=${quality.width}x${quality.height}',
+      'size=${quality.width}x${quality.height} mode=${lanMode ? "LAN" : "on-device"}',
     );
 
-    // Prefer LAN embed so local vectors match the sandbox MobileCLIP-S2.
     List<double>? embedding;
-    if (_fusionApi.baseUrl.isNotEmpty) {
+    if (lanMode) {
       embedding = await _fusionApi.embedCrop(jpegBytes);
       debugPrint(
         '[Enroll] embed_crop ${embedding == null ? "FAIL" : "ok dim=${embedding.length}"}',
       );
     }
 
+    // Phase 5: on-device embed when offline, or when LAN embed failed.
+    if (embedding == null ||
+        embedding.length != ProductEmbeddingRepository.embeddingDim) {
+      final ready = await _onnx.ensureLoaded();
+      if (ready) {
+        embedding = await _onnx.embedJpeg(jpegBytes);
+        debugPrint(
+          '[Enroll] on-device embed ${embedding == null ? "FAIL" : "ok dim=${embedding.length}"}',
+        );
+      } else {
+        debugPrint('[Enroll] on-device embed unavailable (model not ready)');
+      }
+    }
+
     final cropPath = await _repo.saveCropFile(code, jpegBytes);
 
+    var localStored = false;
     if (embedding != null &&
         embedding.length == ProductEmbeddingRepository.embeddingDim) {
       final id = await _repo.insertView(
@@ -136,23 +155,24 @@ class ProductEnrollmentService {
         cropPath: cropPath,
         source: source,
       );
-      if (id == null) {
+      localStored = id != null;
+      if (!localStored) {
         return const EnrollmentResult(
           outcome: EnrollmentOutcome.failedLocal,
           message: 'local insert failed (cap or dim)',
         );
       }
     } else {
-      debugPrint('[Enroll] embed_crop unavailable — LAN register only for $code');
+      debugPrint('[Enroll] no embedding — cannot store local vector for $code');
     }
 
     var lanOk = false;
     var lanSkipped = false;
     int? lanViews;
     String? lanMessage;
-    if (_fusionApi.baseUrl.isEmpty) {
+    if (!lanMode) {
       lanMessage = 'fusionBaseUrl is empty';
-      debugPrint('[Enroll] LAN skipped — empty fusionBaseUrl');
+      debugPrint('[Enroll] LAN skipped — on-device mode');
     } else {
       final reg = await _fusionApi.registerSku(
         scanCode: code,
@@ -174,7 +194,24 @@ class ProductEnrollmentService {
 
     final localCount = await _repo.countForScanCode(code);
 
-    // LAN at view cap still means the gallery already has this SKU for fuse.
+    // Offline success: local vector is enough for on-device ✨.
+    if (!lanMode) {
+      if (localStored && localCount > 0) {
+        return EnrollmentResult(
+          outcome: EnrollmentOutcome.enrolled,
+          message: 'Saved appearance on phone ($localCount views)',
+          localCount: localCount,
+        );
+      }
+      return EnrollmentResult(
+        outcome: EnrollmentOutcome.failedLocal,
+        message:
+            'Could not embed on phone — download the visual model first '
+            '(or set fusionBaseUrl for LAN).',
+        localCount: localCount,
+      );
+    }
+
     if (lanOk || lanSkipped) {
       final views = lanViews ?? localCount;
       return EnrollmentResult(
@@ -192,7 +229,7 @@ class ProductEnrollmentService {
         outcome: EnrollmentOutcome.partialLan,
         message:
             'Saved on phone only — LAN failed (${lanMessage ?? "unreachable"}). '
-            '✨ needs LAN gallery; check Wi‑Fi / sandbox.',
+            'On-device ✨ still works; check Wi‑Fi / sandbox for LAN fuse.',
         localCount: localCount,
         lanViewCount: lanViews,
       );
@@ -245,11 +282,13 @@ class ProductEnrollmentService {
     }
 
     if (localDeleted > 0) {
+      final offline = _fusionApi.baseUrl.isEmpty;
       return ForgetResult(
         outcome: ForgetOutcome.clearedLocalOnly,
-        message:
-            'Cleared local appearance for $code — LAN not cleared '
-            '(${lanMessage ?? "unreachable"}). Check Wi‑Fi / sandbox.',
+        message: offline
+            ? 'Cleared local appearance for $code'
+            : 'Cleared local appearance for $code — LAN not cleared '
+                '(${lanMessage ?? "unreachable"}). Check Wi‑Fi / sandbox.',
         localDeleted: localDeleted,
         lanCleared: false,
       );

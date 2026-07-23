@@ -7,8 +7,8 @@ import 'package:sqflite/sqflite.dart';
 
 /// Local gallery of MobileCLIP embeddings keyed by Excel [scan_code].
 ///
-/// Phase 3: persists confirmations so Phase 5 can search offline; LAN register
-/// remains the live fuse source until then.
+/// Phase 5: on-device I2I search reads these rows when fusionBaseUrl is empty.
+/// LAN register remains the debug fuse source when the URL is set.
 class ProductEmbeddingRepository {
   ProductEmbeddingRepository._();
   static final ProductEmbeddingRepository instance =
@@ -101,6 +101,16 @@ class ProductEmbeddingRepository {
       'SELECT DISTINCT scan_code FROM product_embeddings',
     );
     return rows.map((r) => r['scan_code'] as String).toSet();
+  }
+
+  /// All enrolled views (for offline I2I search).
+  Future<List<StoredProductEmbedding>> listAllViews() async {
+    final db = await _database;
+    final rows = await db.query(
+      'product_embeddings',
+      orderBy: 'scan_code ASC, id ASC',
+    );
+    return rows.map(StoredProductEmbedding.fromMap).toList();
   }
 
   /// Deletes all local views for [scanCode] (and crop files when present).

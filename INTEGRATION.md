@@ -3,7 +3,8 @@
 Short status of how the fusion pipeline is wired into Live Scan.  
 Sibling pipeline repo: `POC 3 COUNTX Fusion Pipeline` (sandbox on port **8000**).
 
-**Defaults:** MobileCLIP-S2 · Excel `scan_code` identity · no YOLO · user always confirms ADD.
+**Defaults:** MobileCLIP-S2 · Excel `scan_code` identity · no YOLO · user always confirms ADD.  
+**Phase 5 default:** `fusionBaseUrl` empty → on-device visual; LAN is opt-in debug.
 
 | Phase | Status | Where |
 |-------|--------|--------|
@@ -12,107 +13,116 @@ Sibling pipeline repo: `POC 3 COUNTX Fusion Pipeline` (sandbox on port **8000**)
 | 2 — Visual match UX | Done | This repo |
 | 3 — Save appearance enroll | Done | Both |
 | 4 — Calibrate / harden | Done | Both |
-| 5 — On-device ONNX | Not started | Both |
+| 5 — On-device ONNX | Done | Both |
+
+Demo scripts: [`DEMO_PHASE4.md`](DEMO_PHASE4.md) (LAN) · [`DEMO_PHASE5.md`](DEMO_PHASE5.md) (offline).
 
 ---
 
-## How Live Scan works today (Phase 4)
+## How Live Scan works today (Phase 5)
 
 1. **Live Scan (camera)** — **barcode → OCR → Excel**. No CLIP. **ADD** counts only (does not enroll).
-2. **Tap ✨** — health-check → center-crop → LAN `/api/fuse`. Offline banner if sandbox down; barcode/OCR keep working.
+2. **Tap ✨** — center-crop → visual identify:
+   - **`fusionBaseUrl` empty (default):** on-device MobileCLIP ORT + I2I cosine over **local SQLite gallery**.
+   - **`fusionBaseUrl` set:** LAN `POST /api/fuse` (debug fallback; health-check banner if sandbox down).
 3. **High** → Visual match card; **Medium / weak (low band ≥ floor)** → top-3 picker; user still taps **ADD**.
-4. **Unknown** (no Excel-mapped candidates or score below floor) → **No visual match** + **Save appearance**.
+4. **Unknown** → **No visual match** + **Save appearance**.
 5. **Save appearance** (face-forward only):
-   - On locked Excel card: capture crop now → local + LAN enroll under `scan_code`.
-   - From ✨ unknown / **None of these**: keep face crop → scan barcode to link → enroll.
-   - Toast reports LAN view count or a clear LAN-failure warning (✨ needs the sandbox gallery).
-6. **Barcode** never enrolls by itself (barcode side ≠ pack face).
-7. Cap ~5 views / code; blurry/tiny crops skipped; **Forget appearance** clears **local + LAN** gallery for that code.
+   - On-device: quality gate → ORT embed → SQLite (+ JPEG crop under app documents).
+   - LAN mode: also `embedCrop` + `register_sku` when URL set.
+6. **Barcode** never enrolls by itself. Cap ~5 views/code; **Forget appearance** clears local (+ LAN when URL set).
+
+### Visual gallery vs Excel (important)
+
+| | Excel price book | Visual gallery |
+|--|------------------|----------------|
+| Role | Identity / name / price | Pack-face fingerprints for ✨ |
+| Size | Full uploaded sheet | Only **Save appearance** (phone) and/or sandbox seeds (LAN) |
+| ✨ searches? | No — only maps winners | Yes — nearest neighbors |
+
+Offline ✨ can only suggest products you previously **Save appearance**’d on this phone (or that still exist in SQLite). It does **not** search all Excel rows. Unenrolled faces either hit **unknown** or (if scores clear the weak floor) look like the nearest enrolled / seed faces — not hardcoded brands.
+
+### Visual mode switch
+
+| Config | Behavior |
+|--------|----------|
+| `fusionBaseUrl = ""` | On-device ORT + SQLite I2I |
+| `fusionBaseUrl = "http://<PC-IP>:8000/"` | LAN fuse (debug) |
+| `mobileClipModelBaseUrl` | HTTP base for download-on-first-run (`…/models/`) |
 
 ---
 
-## Phase 0 (fusion pipeline) — done
+## Phase 5 — On-device MobileCLIP (done)
 
-- `dataset/sku_registry.json` — 12 seed SKUs
-- Sandbox seed + `POST /api/fuse` (`scan_code`, `top_k`, `resolution_status`: `unknown` | `needs_review` | `auto-accepted`)
-- `POST /api/embed_crop`, `POST /api/register_sku` (`append=true` for multi-view)
-
-Run sandbox from the pipeline repo (preferred — strips conda PATH conflicts):
-
-```powershell
-.\start_sandbox.ps1
-```
-
-Or manually with the venv python (avoid `conda activate`):
-
-```powershell
-.\venv\Scripts\python.exe countx_live_preview_sandbox\server.py
-```
-
-Phone and PC must be on the same Wi‑Fi.
-
----
-
-## Phase 1 (this app) — done
+### What changed in this app
 
 | File | Role |
 |------|------|
-| `lib/config/config.dart` | `fusionBaseUrl` |
-| `lib/services/fusion_api_service.dart` | `fuseFrame`, `embedCrop`, `registerSku`, `forgetSku`, `healthCheck` |
-| `lib/models/fusion_result.dart` | Fuse response |
-| `lib/utils/fusion_frame_crop.dart` | Center bottle JPEG crop |
+| `lib/config/config.dart` | Empty `fusionBaseUrl` by default; `mobileClipModelBaseUrl` for model HTTP |
+| `lib/services/mobileclip_model_store.dart` | Download/cache `mobileclip_visual.onnx` + `.onnx.data` (~147 MB) into documents `mobileclip/` |
+| `lib/utils/mobileclip_preprocess.dart` | 256 bicubic + CLIP mean/std (sandbox parity) |
+| `lib/services/mobileclip_onnx_service.dart` | `flutter_onnxruntime` file session → L2 512-d |
+| `lib/services/local_gallery_search.dart` | Max cosine over SQLite views (I2I-only; no T2I) |
+| `lib/services/product_identification_service.dart` | On-device branch when URL empty; Excel display-name fallback |
+| `lib/services/product_enrollment_service.dart` | On-device embed when LAN unavailable; offline success toast |
+| `lib/services/product_embedding_repository.dart` | `listAllViews()` for offline search |
+| `lib/screens/live_scan_screen.dart` | Model missing/download banner; on-device ✨; product title fallback |
+| `pubspec.yaml` | `flutter_onnxruntime` |
+| `ios/Podfile` | iOS 16 + static linkage (ORT) |
+| `android/app/proguard-rules.pro` | Keep `ai.onnxruntime.**` |
+| `test/mobileclip_preprocess_parity_test.dart` | Dart vs Python preprocess cosine ≥ 0.99 |
+| `test/local_gallery_search_test.dart` | Cosine unit checks |
+| `DEMO_PHASE5.md` | Offline demo script |
 
----
-
-## Phase 2 (this app) — done
-
-✨-only identify (not auto-CLIP after OCR miss):
-
-| File | Role |
-|------|------|
-| `lib/services/product_identification_service.dart` | Fuse + bands + open-set unknown |
-| `lib/models/identification_result.dart` | Result models |
-| `lib/screens/live_scan_screen.dart` | ✨ UX |
-
-Bands (shared with sandbox JSON): High ≥0.70+margin; Medium ≥0.38; weak picker ≥0.30; else unknown.
-
----
-
-## Phase 3 (this app + sandbox) — done
+### Sibling pipeline (not this git repo)
 
 | File | Role |
 |------|------|
-| `lib/services/product_embedding_repository.dart` | Local `sqflite` gallery |
-| `lib/services/product_enrollment_service.dart` | Quality gate → local + LAN |
-| `lib/utils/crop_quality.dart` | Blur / size gate |
-| `lib/screens/live_scan_screen.dart` | Save appearance; barcode-link; Forget |
-| `countx_live_preview_sandbox/server.py` | Fuse `unknown`; register append |
+| `countx_live_preview_sandbox/server.py` | Serves `/models/` for first-run download |
+| `scripts/export_phase5_parity_fixture.py` / `assert_phase5_parity.py` | Python ORT cosine ≥ 0.99 |
+| `dataset/phase5_parity/` | Fixture JPEG + expected tensor/embedding |
+
+### Locked Phase 5 decisions
+
+- **Model delivery:** download-on-first-run (not bundled in APK); USB/`adb` documented as fallback.
+- **Offline scoring:** I2I-only over SQLite (no on-device text encoder).
+- **Mode switch:** empty URL → on-device; non-empty → LAN debug.
+- **Bands:** reuse Phase 4 shared thresholds; tweak JSON+Dart together if phone I2I drifts.
+
+### Model install (first run)
+
+1. Start sandbox (`:8000`) so `/models/mobileclip_visual.onnx(.data)` is reachable, **or**
+2. USB / `adb push` both files into the app documents folder `mobileclip/` (same filenames).
+3. In Live Scan, if the teal banner says model missing → **Download** (~147 MB once). After that, airplane mode / stopped sandbox still works for ✨.
+
+Expected sizes: graph ~3.26 MB, weights ~137.4 MB.
+
+**Full restart required** after changing `fusionBaseUrl` / `mobileClipModelBaseUrl` (hot reload does not rebuild `const` config).
 
 ---
 
-## Phase 4 (this app + sandbox) — done
+## Phase 0–4 (done)
 
-| File | Role |
-|------|------|
-| `countx_live_preview_sandbox/fusion_thresholds.json` | Shared thresholds |
-| `lib/config/fusion_thresholds.dart` | Flutter mirror |
-| `scripts/assert_threshold_parity.py` | JSON ↔ Dart check |
-| `scripts/eval_phase4_fuse.py` | HTTP fuse metrics |
-| `dataset/phase4_eval/` | Manifest + crop corpus |
-| `POST /api/forget_sku` | LAN gallery wipe per `scan_code` |
-| `DEMO_PHASE4.md` | Teammate demo + metrics sheet |
+See git history / [`DEMO_PHASE4.md`](DEMO_PHASE4.md). Shared thresholds: `fusion_thresholds.json` ↔ `fusion_thresholds.dart` (`lib/config/fusion_thresholds.dart`).
 
-**Demo:** see [`DEMO_PHASE4.md`](DEMO_PHASE4.md). Live checks 1–5 (barcode, Save appearance → ✨, confusers, offline, Forget+re-enroll) accepted; similar Red Bull flavors may need the top‑3 picker.
+Bands: High ≥0.70+margin; Medium ≥0.38; weak picker ≥0.30; else unknown.
 
 ---
 
 ## Setup checklist
 
-1. Start sandbox (`:8000`).
-2. Set `AppConfig.fusionBaseUrl` to `http://<PC-LAN-IP>:8000/`.
-3. Hot-restart app.
-4. Barcode/OCR unchanged; ✨ for visual; Save appearance for enroll.
-5. After threshold edits: `python scripts/assert_threshold_parity.py`.
+**On-device (default)**
+
+1. `AppConfig.fusionBaseUrl = ""`.
+2. `AppConfig.mobileClipModelBaseUrl` = `http://<PC-LAN-IP>:8000/models/` (or empty + USB/`adb`).
+3. Start sandbox if downloading over Wi‑Fi.
+4. Full restart app → Download model once → Save appearance → stop sandbox / airplane → ✨.
+
+**LAN debug**
+
+1. Start sandbox (`.\start_sandbox.ps1` or venv `server.py`).
+2. Set `fusionBaseUrl` to `http://<PC-LAN-IP>:8000/`.
+3. Full restart; ✨ uses `/api/fuse` (scores may differ from on-device I2I — compare rank/band, not raw equality).
 
 ---
 
@@ -124,6 +134,7 @@ Bands (shared with sandbox JSON): High ≥0.70+margin; Medium ≥0.38; weak pick
 - Classifying all ~11k Excel rows without enrollment.
 - Mixing SigLIP with MobileCLIP.
 - YOLO in the live path.
-- On-device ONNX (Phase 5).
+- Bundling 147 MB into the APK/IPA (download / USB instead).
+- On-device text encoder / T2I blend (I2I-only offline).
 
-Known cosmetic: some Excel rows show `(no name)` while the description sits in `code`.
+Display: some Excel rows leave Item Description empty and put the label in Item Code — Live Scan / ✨ fall back to `code` before showing the barcode.

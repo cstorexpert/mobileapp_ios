@@ -8,14 +8,22 @@ import 'package:countx/models/fusion_result.dart';
 import 'package:countx/models/identification_result.dart';
 import 'package:countx/screens/transactions.dart' show StockItem;
 import 'package:countx/services/fusion_api_service.dart';
+import 'package:countx/services/local_gallery_search.dart';
+import 'package:countx/services/mobileclip_onnx_service.dart';
 import 'package:countx/utils/scan_code_utils.dart';
 
-/// Orchestrates LAN MobileCLIP fuse + confidence banding for Live Scan.
+/// Orchestrates MobileCLIP identify + confidence banding for Live Scan.
+///
+/// Empty [FusionApiService.baseUrl] → on-device ORT + SQLite I2I.
+/// Non-empty → LAN `/api/fuse` (debug fallback).
 ///
 /// Does not touch barcode/OCR — callers invoke this only after those miss.
 class ProductIdentificationService {
-  ProductIdentificationService({FusionApiService? fusionApi})
-      : _fusionApi = fusionApi ??
+  ProductIdentificationService({
+    FusionApiService? fusionApi,
+    MobileClipOnnxService? onnx,
+    LocalGallerySearch? localSearch,
+  })  : _fusionApi = fusionApi ??
             FusionApiService(
               dio: Dio(
                 BaseOptions(
@@ -25,11 +33,16 @@ class ProductIdentificationService {
                   sendTimeout: const Duration(seconds: 20),
                 ),
               ),
-            );
+            ),
+        _onnx = onnx ?? MobileClipOnnxService(),
+        _localSearch = localSearch ?? LocalGallerySearch();
 
   final FusionApiService _fusionApi;
+  final MobileClipOnnxService _onnx;
+  final LocalGallerySearch _localSearch;
 
   FusionApiService get fusionApi => _fusionApi;
+  MobileClipOnnxService get onnx => _onnx;
 
   /// Mirrors [FusionThresholds] for tests / callers that import this class.
   static const double highScoreThreshold = FusionThresholds.highScore;
@@ -37,17 +50,120 @@ class ProductIdentificationService {
   static const double mediumScoreThreshold = FusionThresholds.mediumScore;
   static const double lowScoreFloor = FusionThresholds.lowScoreFloor;
 
-  /// Runs `/api/fuse` on a center crop and maps winners to Excel rows only.
+  bool get useOnDevice => _fusionApi.baseUrl.isEmpty;
+
+  /// Runs visual identify on a center crop and maps winners to Excel rows only.
   Future<IdentificationResult> identifyFromCrop({
     required Uint8List jpegBytes,
     required int width,
     required int height,
     required Map<String, StockItem> previousStock,
   }) async {
-    if (_fusionApi.baseUrl.isEmpty) {
-      return IdentificationResult.none(message: 'fusionBaseUrl is empty');
+    if (useOnDevice) {
+      return _identifyOnDevice(
+        jpegBytes: jpegBytes,
+        previousStock: previousStock,
+      );
+    }
+    return _identifyLan(
+      jpegBytes: jpegBytes,
+      width: width,
+      height: height,
+      previousStock: previousStock,
+    );
+  }
+
+  Future<IdentificationResult> _identifyOnDevice({
+    required Uint8List jpegBytes,
+    required Map<String, StockItem> previousStock,
+  }) async {
+    final modelReady = await _onnx.isReady;
+    if (!modelReady) {
+      return IdentificationResult.none(
+        message:
+            'Visual model not installed — tap Download or set mobileClipModelBaseUrl',
+      );
     }
 
+    final loaded = await _onnx.ensureLoaded();
+    if (!loaded) {
+      return IdentificationResult.none(
+        message: 'Could not load on-device MobileCLIP model',
+      );
+    }
+
+    final query = await _onnx.embedJpeg(jpegBytes);
+    if (query == null) {
+      return IdentificationResult.none(
+        message: 'On-device embedding failed',
+      );
+    }
+
+    final hits = await _localSearch.search(query, topK: 10);
+    if (hits.isEmpty) {
+      final raw = FusionResult(
+        status: 'success',
+        scanCode: '',
+        skuName: '',
+        excelName: '',
+        confidence: 0,
+        resolutionStatus: 'unknown',
+        topK: const [],
+        message: 'Local gallery empty — Save appearance first',
+      );
+      return IdentificationResult.unknown(
+        message: 'No visual match in local gallery',
+        raw: raw,
+      );
+    }
+
+    final topK = [
+      for (final h in hits)
+        FusionCandidate(
+          scanCode: h.scanCode,
+          skuName: h.scanCode,
+          excelName: h.scanCode,
+          score: h.score,
+        ),
+    ];
+    final top = hits.first;
+    final margin =
+        hits.length > 1 ? top.score - hits[1].score : top.score;
+    final resolution = top.score < FusionThresholds.unknownScoreFloor
+        ? 'unknown'
+        : (top.score >= FusionThresholds.autoAcceptScore &&
+                margin >= FusionThresholds.autoAcceptMargin
+            ? 'auto-accepted'
+            : 'needs_review');
+
+    final raw = FusionResult(
+      status: 'success',
+      scanCode: resolution == 'unknown' ? '' : top.scanCode,
+      skuName: top.scanCode,
+      excelName: top.scanCode,
+      confidence: top.score,
+      resolutionStatus: resolution,
+      topK: topK,
+      message: 'on-device I2I',
+    );
+
+    final mapped = _mapInSheetCandidates(raw, previousStock);
+    debugPrint(
+      '[ProductID] on-device status=${raw.resolutionStatus} '
+      'conf=${raw.confidence.toStringAsFixed(3)} '
+      'mapped=${mapped.length} '
+      'top=${mapped.isEmpty ? "-" : "${mapped.first.scanCode}@${mapped.first.score.toStringAsFixed(3)}"}',
+    );
+
+    return _bandMappedResult(raw, mapped);
+  }
+
+  Future<IdentificationResult> _identifyLan({
+    required Uint8List jpegBytes,
+    required int width,
+    required int height,
+    required Map<String, StockItem> previousStock,
+  }) async {
     final raw = await _fusionApi.fuseFrame(
       jpegBytes: jpegBytes,
       x1: 0,
@@ -64,8 +180,6 @@ class ProductIdentificationService {
       );
     }
 
-    // Always map top_k → Excel first. Server may mark open-set "unknown" and
-    // clear the winner, but top_k still lists gallery hits (incl. enrolled SKUs).
     final mapped = _mapInSheetCandidates(raw, previousStock);
     debugPrint(
       '[ProductID] fuse status=${raw.resolutionStatus} '
@@ -75,6 +189,13 @@ class ProductIdentificationService {
       'top=${mapped.isEmpty ? "-" : "${mapped.first.scanCode}@${mapped.first.score.toStringAsFixed(3)}"}',
     );
 
+    return _bandMappedResult(raw, mapped);
+  }
+
+  IdentificationResult _bandMappedResult(
+    FusionResult raw,
+    List<VisualCandidate> mapped,
+  ) {
     if (mapped.isEmpty) {
       return IdentificationResult.unknown(
         message: raw.isUnknownGallery
@@ -92,7 +213,6 @@ class ProductIdentificationService {
       rawConfidence: raw.confidence,
     );
 
-    // Absolute floor: no claim at all.
     if (mapped.first.score < lowScoreFloor) {
       return IdentificationResult.unknown(
         message: 'Visual confidence too low',
@@ -100,7 +220,6 @@ class ProductIdentificationService {
       );
     }
 
-    // Phase 4: low band still offers a weak top-3 picker (not "No visual match").
     if (band == VisualConfidenceBand.low) {
       return IdentificationResult(
         source: IdentificationSource.visual,
@@ -112,7 +231,6 @@ class ProductIdentificationService {
       );
     }
 
-    // Usable Excel-mapped hit — show picker/card even if server said unknown.
     return IdentificationResult(
       source: IdentificationSource.visual,
       band: band,
@@ -142,8 +260,6 @@ class ProductIdentificationService {
       return VisualConfidenceBand.medium;
     }
 
-    // Soft floor: if server confidence is a bit higher than mapped top1, still
-    // allow picker when above floor (rare mismatch).
     final server = rawConfidence ?? score;
     if (server >= mediumScoreThreshold && score >= lowScoreFloor) {
       return VisualConfidenceBand.medium;
@@ -168,9 +284,7 @@ class ProductIdentificationService {
       out.add(
         VisualCandidate(
           scanCode: stock.scanCode ?? code,
-          displayName: stock.name.isNotEmpty
-              ? stock.name
-              : (displayName.isNotEmpty ? displayName : code),
+          displayName: _stockDisplayName(stock, displayName, code),
           score: score,
           stockItem: stock,
         ),
@@ -185,7 +299,6 @@ class ProductIdentificationService {
       );
     }
 
-    // Ensure winner is considered even if top_k omitted it.
     if (raw.scanCode.isNotEmpty) {
       consider(
         raw.scanCode,
@@ -196,5 +309,18 @@ class ProductIdentificationService {
     }
 
     return out;
+  }
+
+  /// Prefer Excel Item Description, then Item Code, then any fuse label, then scan_code.
+  /// Ampm sheets often leave description empty and put the readable name in `code`.
+  static String _stockDisplayName(
+    StockItem stock,
+    String fuseLabel,
+    String scanCode,
+  ) {
+    if (stock.name.trim().isNotEmpty) return stock.name.trim();
+    if (stock.code.trim().isNotEmpty) return stock.code.trim();
+    if (fuseLabel.trim().isNotEmpty) return fuseLabel.trim();
+    return scanCode;
   }
 }

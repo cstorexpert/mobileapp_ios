@@ -40,6 +40,10 @@ android {
             // until ProGuard keep rules are added for those optional paths.
             isMinifyEnabled = false
             isShrinkResources = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 }

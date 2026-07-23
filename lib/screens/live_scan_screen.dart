@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart'
@@ -15,6 +16,7 @@ import 'package:countx/config/config.dart';
 import 'package:countx/models/fusion_result.dart';
 import 'package:countx/models/identification_result.dart';
 import 'package:countx/screens/transactions.dart' show StockItem, ScannedItem;
+import 'package:countx/services/mobileclip_onnx_service.dart';
 import 'package:countx/services/product_enrollment_service.dart';
 import 'package:countx/services/product_identification_service.dart';
 import 'package:countx/utils/camera_mlkit_input_image.dart';
@@ -40,7 +42,8 @@ enum _UnknownSheetPhase {
 /// decode, then OCR + fuzzy name match on the label when no barcode is read
 /// (e.g. bottle facing camera without a visible code).
 ///
-/// Phase 2 visual: LAN MobileCLIP runs only when the user taps ✨ (fusion).
+/// Phase 2/5 visual: MobileCLIP runs only when the user taps ✨ (fusion).
+/// Empty fusionBaseUrl → on-device ORT; non-empty → LAN sandbox (debug).
 /// Normal Live Scan stays barcode → OCR. CLIP never overrides a barcode hit.
 ///
 /// Phase 3 Save appearance: barcode identifies Excel scan_code only; enroll
@@ -120,10 +123,12 @@ class _LiveScanScreenState extends State<LiveScanScreen>
   int _stableFrameCount = 0;
   bool _framingPulseWasActive = false;
 
-  /// Phase 2: ✨-triggered LAN MobileCLIP (never auto-runs in the camera loop).
-  final ProductIdentificationService _productId =
-      ProductIdentificationService();
-  final ProductEnrollmentService _enrollment = ProductEnrollmentService();
+  /// Phase 2/5: ✨-triggered MobileCLIP (never auto-runs in the camera loop).
+  final MobileClipOnnxService _onnx = MobileClipOnnxService();
+  late final ProductIdentificationService _productId =
+      ProductIdentificationService(onnx: _onnx);
+  late final ProductEnrollmentService _enrollment =
+      ProductEnrollmentService(onnx: _onnx);
   bool _fusionBusy = false;
   FusionResult? _fusionDebugResult;
   List<VisualCandidate>? _visualPickerCandidates;
@@ -144,6 +149,11 @@ class _LiveScanScreenState extends State<LiveScanScreen>
 
   /// Phase 4: sandbox unreachable — banner only; barcode/OCR keep running.
   bool _fusionOffline = false;
+
+  /// Phase 5 on-device: model missing / download progress (barcode/OCR keep running).
+  bool _modelMissing = false;
+  bool _modelDownloading = false;
+  double _modelDownloadProgress = 0;
 
   /// True while the quantity / unknown / visual-picker overlay is active.
   bool get _isInputting =>
@@ -174,12 +184,45 @@ class _LiveScanScreenState extends State<LiveScanScreen>
 
   Future<void> _refreshFusionHealth() async {
     if (AppConfig.fusionBaseUrl.isEmpty) {
-      if (mounted) setState(() => _fusionOffline = true);
+      // On-device mode: check cached MobileCLIP model (not LAN health).
+      final ready = await _onnx.isReady;
+      if (!mounted) return;
+      setState(() {
+        _fusionOffline = false;
+        _modelMissing = !ready;
+      });
       return;
     }
     final ok = await _productId.fusionApi.healthCheck();
     if (!mounted) return;
-    setState(() => _fusionOffline = !ok);
+    setState(() {
+      _fusionOffline = !ok;
+      _modelMissing = false;
+    });
+  }
+
+  Future<void> _downloadVisualModel() async {
+    if (_modelDownloading) return;
+    setState(() {
+      _modelDownloading = true;
+      _modelDownloadProgress = 0;
+    });
+    final ok = await _onnx.ensureLoaded(
+      onDownloadProgress: (p) {
+        if (mounted) setState(() => _modelDownloadProgress = p);
+      },
+    );
+    if (!mounted) return;
+    setState(() {
+      _modelDownloading = false;
+      _modelMissing = !ok;
+      if (ok) _modelDownloadProgress = 1;
+    });
+    _showFusionSnack(
+      ok
+          ? 'Visual model ready — ✨ works offline'
+          : 'Model download failed — check mobileClipModelBaseUrl or USB/adb push',
+    );
   }
 
   Future<void> _initCamera() async {
@@ -295,33 +338,44 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     unawaited(_processCameraImage(image));
   }
 
-  /// ✨ button: capture still → LAN MobileCLIP → top-k / product card.
+  /// ✨ button: capture still → on-device or LAN MobileCLIP → top-k / product card.
   /// Does not replace barcode/OCR during normal scanning; never auto-adds.
   Future<void> _runFusionIdentify() async {
-    if (_fusionBusy) return;
-    if (AppConfig.fusionBaseUrl.isEmpty) {
-      setState(() => _fusionOffline = true);
-      _showFusionSnack('fusionBaseUrl is empty in config.dart');
-      return;
-    }
+    if (_fusionBusy || _modelDownloading) return;
+    final onDevice = AppConfig.fusionBaseUrl.isEmpty;
     final controller = _cameraController;
     if (controller == null || !controller.value.isInitialized) {
       _showFusionSnack('Camera not ready');
       return;
     }
 
-    // Pre-flight health so we fail fast with a clear offline message.
-    final healthy = await _productId.fusionApi.healthCheck();
-    if (!mounted) return;
-    if (!healthy) {
-      setState(() => _fusionOffline = true);
-      _showFusionSnack(
-        'Visual match offline — is the sandbox running at ${AppConfig.fusionBaseUrl}?',
-      );
-      return;
-    }
-    if (_fusionOffline) {
-      setState(() => _fusionOffline = false);
+    if (onDevice) {
+      final ready = await _onnx.isReady;
+      if (!mounted) return;
+      if (!ready) {
+        setState(() => _modelMissing = true);
+        _showFusionSnack(
+          'Visual model not installed — tap Download on the banner',
+        );
+        return;
+      }
+      if (_modelMissing) {
+        setState(() => _modelMissing = false);
+      }
+    } else {
+      // Pre-flight health so we fail fast with a clear offline message.
+      final healthy = await _productId.fusionApi.healthCheck();
+      if (!mounted) return;
+      if (!healthy) {
+        setState(() => _fusionOffline = true);
+        _showFusionSnack(
+          'Visual match offline — is the sandbox running at ${AppConfig.fusionBaseUrl}?',
+        );
+        return;
+      }
+      if (_fusionOffline) {
+        setState(() => _fusionOffline = false);
+      }
     }
 
     setState(() {
@@ -360,9 +414,16 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       if (!result.hasVisualClaim) {
         final raw = result.raw;
         if (raw != null && !raw.isSuccess) {
-          // Phase 4: snack only — do not block barcode/OCR with debug overlay.
-          setState(() => _fusionOffline = true);
+          // Snack only — do not block barcode/OCR with debug overlay.
+          if (!onDevice) {
+            setState(() => _fusionOffline = true);
+          }
           _showFusionSnack(raw.message ?? 'Fusion failed');
+          return;
+        }
+        // Hard failure without a fuse payload (e.g. embed/model error).
+        if (raw == null) {
+          _showFusionSnack(result.message ?? 'Visual match unavailable');
           return;
         }
         // Open-set / low confidence — do not force a seed SKU.
@@ -401,10 +462,14 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     } catch (e) {
       debugPrint('[LiveScan] ✨ fusion error: $e');
       if (mounted) {
-        setState(() => _fusionOffline = true);
-        _showFusionSnack(
-          'Fusion failed. Is the sandbox running at ${AppConfig.fusionBaseUrl}?',
-        );
+        if (!onDevice) {
+          setState(() => _fusionOffline = true);
+          _showFusionSnack(
+            'Fusion failed. Is the sandbox running at ${AppConfig.fusionBaseUrl}?',
+          );
+        } else {
+          _showFusionSnack('On-device visual match failed: $e');
+        }
       }
     } finally {
       try {
@@ -927,6 +992,15 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     return scanCode;
   }
 
+  /// Card title: Item Description → Item Code → scan_code (Ampm quirk).
+  String _productTitle(StockItem p) {
+    if (p.name.trim().isNotEmpty) return p.name.trim();
+    if (p.code.trim().isNotEmpty) return p.code.trim();
+    final scan = p.scanCode ?? _detectedCode;
+    if (scan != null && scan.trim().isNotEmpty) return scan.trim();
+    return '(no name)';
+  }
+
   Future<void> _runEnroll({
     required String scanCode,
     required String skuName,
@@ -1217,7 +1291,80 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                 ),
               ),
               _buildTopBar(context),
-              if (_fusionOffline)
+              if (_modelMissing || _modelDownloading)
+                Positioned(
+                  left: 12,
+                  right: 12,
+                  top: mq.padding.top + 52,
+                  child: Material(
+                    color: Colors.teal.shade900.withValues(alpha: 0.94),
+                    borderRadius: BorderRadius.circular(12),
+                    elevation: 2,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Row(
+                            children: [
+                              const Icon(
+                                Icons.download_for_offline,
+                                color: Colors.white,
+                                size: 18,
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  _modelDownloading
+                                      ? 'Downloading visual model… '
+                                          '${(_modelDownloadProgress * 100).clamp(0, 100).toStringAsFixed(0)}%'
+                                      : 'Visual model not installed — barcode/OCR still work',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                              if (!_modelDownloading)
+                                TextButton(
+                                  onPressed: () =>
+                                      unawaited(_downloadVisualModel()),
+                                  style: TextButton.styleFrom(
+                                    foregroundColor: Colors.white,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                    ),
+                                    minimumSize: Size.zero,
+                                    tapTargetSize:
+                                        MaterialTapTargetSize.shrinkWrap,
+                                  ),
+                                  child: const Text(
+                                    'Download',
+                                    style: TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                            ],
+                          ),
+                          if (_modelDownloading) ...[
+                            const SizedBox(height: 8),
+                            LinearProgressIndicator(
+                              value: _modelDownloadProgress > 0
+                                  ? _modelDownloadProgress
+                                  : null,
+                              backgroundColor: Colors.white24,
+                              color: Colors.white,
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                )
+              else if (_fusionOffline)
                 Positioned(
                   left: 12,
                   right: 12,
@@ -1483,7 +1630,9 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                 icon: Icons.auto_awesome,
                 onTap:
                     _fusionBusy ? () {} : () => unawaited(_runFusionIdentify()),
-                tooltip: 'Visual match (LAN MobileCLIP)',
+                tooltip: AppConfig.fusionBaseUrl.isEmpty
+                    ? 'Visual match (on-device MobileCLIP)'
+                    : 'Visual match (LAN MobileCLIP)',
               ),
               const SizedBox(width: 8),
               _circleButton(
@@ -2147,7 +2296,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        p.name.isEmpty ? '(no name)' : p.name,
+                        _productTitle(p),
                         style: const TextStyle(
                           fontSize: 17,
                           fontWeight: FontWeight.w800,
