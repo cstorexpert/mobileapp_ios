@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart'
@@ -17,6 +16,7 @@ import 'package:countx/models/fusion_result.dart';
 import 'package:countx/models/identification_result.dart';
 import 'package:countx/screens/transactions.dart' show StockItem, ScannedItem;
 import 'package:countx/services/mobileclip_onnx_service.dart';
+import 'package:countx/services/product_embedding_repository.dart';
 import 'package:countx/services/product_enrollment_service.dart';
 import 'package:countx/services/product_identification_service.dart';
 import 'package:countx/utils/camera_mlkit_input_image.dart';
@@ -47,7 +47,9 @@ enum _UnknownSheetPhase {
 /// Normal Live Scan stays barcode → OCR. CLIP never overrides a barcode hit.
 ///
 /// Phase 3 Save appearance: barcode identifies Excel scan_code only; enroll
-/// happens on explicit face-forward Save appearance (not on ADD / barcode lock).
+/// happens on explicit face-forward Save appearance (Capture → Confirm), not on
+/// ADD / barcode lock. Confirmed crops are embedded and discarded (no on-disk
+/// JPEG gallery).
 ///
 /// Not-in-sheet flow: user can inject a row into [previousStock] and add with
 /// `__source: manual` so it appears in the missing-items report.
@@ -136,7 +138,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
   /// Weak-band picker (Phase 4) — show caution label in picker header.
   bool _visualPickerWeak = false;
 
-  /// Face crop from ✨ (or capture) for Save appearance after barcode link.
+  /// Face crop from ✨ (kept only until capture overlay Confirm; not persisted).
   Uint8List? _pendingEnrollCrop;
 
   /// ✨ open-set unknown — offer Save appearance (no forced seed SKU).
@@ -144,6 +146,15 @@ class _LiveScanScreenState extends State<LiveScanScreen>
 
   /// After Save appearance from ✨ unknown / None of these: wait for barcode.
   bool _awaitingBarcodeForEnroll = false;
+
+  /// Dedicated Save appearance UI (hides tall product card; framing stays visible).
+  bool _appearanceCaptureActive = false;
+
+  /// In-memory crop awaiting human Confirm / Retake (never written to disk).
+  Uint8List? _pendingVerifyCrop;
+
+  /// Local gallery view count for the product in the current appearance session.
+  int _appearanceViewCount = 0;
 
   bool _savingAppearance = false;
 
@@ -155,8 +166,9 @@ class _LiveScanScreenState extends State<LiveScanScreen>
   bool _modelDownloading = false;
   double _modelDownloadProgress = 0;
 
-  /// True while the quantity / unknown / visual-picker overlay is active.
+  /// True while the quantity / unknown / visual-picker / appearance overlay is active.
   bool get _isInputting =>
+      _appearanceCaptureActive ||
       _visualPickerCandidates != null ||
       _showUnknownVisualCard ||
       (_lockPhase == _LockPhase.locked &&
@@ -783,9 +795,11 @@ class _LiveScanScreenState extends State<LiveScanScreen>
 
     _syncQtyFieldFromState();
 
-    // Face-forward enroll after barcode identity (Save appearance link flow).
+    // Barcode-link enroll: open capture/verify overlay (not auto-enroll).
     if (linkProduct != null) {
-      unawaited(_enrollAfterBarcodeLink(linkProduct));
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_enterAppearanceCapture());
+      });
     } else if (wasLinking && found == null && mounted) {
       _showFusionSnack(
         'Barcode not in Excel — cannot save appearance for this code',
@@ -832,8 +846,11 @@ class _LiveScanScreenState extends State<LiveScanScreen>
       _ocrNoMatchSnippet = null;
       _visualPickerCandidates = null;
       _pendingEnrollCrop = null;
+      _pendingVerifyCrop = null;
       _showUnknownVisualCard = false;
       _awaitingBarcodeForEnroll = false;
+      _appearanceCaptureActive = false;
+      _appearanceViewCount = 0;
       _savingAppearance = false;
       if (resetManualQty) {
         _manualCount = 1;
@@ -919,10 +936,78 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     _clearScanUiForNextItem(resetManualQty: true);
   }
 
-  /// Locked Excel card: user confirmed face-forward → capture + enroll.
-  Future<void> _saveAppearanceForLockedProduct() async {
+  /// Hide tall product card; show compact capture/verify overlay.
+  Future<void> _enterAppearanceCapture() async {
     final product = _currentProduct;
     if (product == null || _savingAppearance) return;
+    final scanCode = product.scanCode ?? _detectedCode ?? '';
+    if (scanCode.isEmpty) {
+      _showFusionSnack('No scan code — cannot save appearance');
+      return;
+    }
+    final count =
+        await ProductEmbeddingRepository.instance.countForScanCode(scanCode);
+    if (!mounted) return;
+    if (count >= ProductEmbeddingRepository.maxViewsPerScanCode) {
+      _showFusionSnack(
+        'Already have ${ProductEmbeddingRepository.maxViewsPerScanCode} local views. '
+        'Tap Forget appearance to replace.',
+      );
+      return;
+    }
+    setState(() {
+      _appearanceCaptureActive = true;
+      _appearanceViewCount = count;
+      // Prefer ✨ face crop as first preview when linking; else live Capture.
+      _pendingVerifyCrop = _pendingEnrollCrop;
+      _pendingEnrollCrop = null;
+      _showUnknownVisualCard = false;
+      _visualPickerCandidates = null;
+      _hideTimer?.cancel();
+      _hideTimer = null;
+    });
+  }
+
+  void _exitAppearanceCapture() {
+    if (!mounted) return;
+    setState(() {
+      _appearanceCaptureActive = false;
+      _pendingVerifyCrop = null;
+      _appearanceViewCount = 0;
+      _savingAppearance = false;
+    });
+  }
+
+  Future<void> _onAppearanceCapturePressed() async {
+    if (_savingAppearance || !_appearanceCaptureActive) return;
+    if (_appearanceViewCount >=
+        ProductEmbeddingRepository.maxViewsPerScanCode) {
+      _showFusionSnack('Appearance full — Forget appearance to replace');
+      return;
+    }
+    setState(() => _savingAppearance = true);
+    try {
+      final cropBytes = await _captureEnrollCrop();
+      if (!mounted) return;
+      if (cropBytes == null) {
+        _showFusionSnack('Could not capture a clear face crop');
+        return;
+      }
+      setState(() => _pendingVerifyCrop = cropBytes);
+    } finally {
+      if (mounted) setState(() => _savingAppearance = false);
+    }
+  }
+
+  void _onAppearanceRetake() {
+    if (!mounted) return;
+    setState(() => _pendingVerifyCrop = null);
+  }
+
+  Future<void> _onAppearanceConfirm() async {
+    final product = _currentProduct;
+    final cropBytes = _pendingVerifyCrop;
+    if (product == null || cropBytes == null || _savingAppearance) return;
     final scanCode = product.scanCode ?? _detectedCode ?? '';
     if (scanCode.isEmpty) {
       _showFusionSnack('No scan code — cannot save appearance');
@@ -931,15 +1016,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
 
     setState(() => _savingAppearance = true);
     try {
-      // Always capture now — barcode-side frames must not be reused.
-      final cropBytes = await _captureEnrollCrop();
-      if (cropBytes == null) {
-        if (mounted) {
-          _showFusionSnack('Could not capture a clear face crop');
-        }
-        return;
-      }
-      await _runEnroll(
+      final result = await _enrollment.enrollAfterConfirm(
         scanCode: scanCode,
         skuName: _displayNameForEnroll(product, scanCode),
         department: product.department.isNotEmpty
@@ -948,39 +1025,34 @@ class _LiveScanScreenState extends State<LiveScanScreen>
         jpegBytes: cropBytes,
         source: _scannedItemSource,
       );
-    } finally {
-      if (mounted) setState(() => _savingAppearance = false);
-    }
-  }
+      if (!mounted) return;
+      _showEnrollResult(result, scanCode);
 
-  /// After ✨ Save appearance → barcode lock: enroll face crop under scan_code.
-  Future<void> _enrollAfterBarcodeLink(StockItem product) async {
-    final scanCode = product.scanCode ?? _detectedCode ?? '';
-    if (scanCode.isEmpty) return;
-
-    setState(() => _savingAppearance = true);
-    try {
-      // Prefer ✨ face crop; if missing, capture now (user should face-forward).
-      Uint8List? cropBytes = _pendingEnrollCrop;
-      cropBytes ??= await _captureEnrollCrop();
-      if (cropBytes == null) {
-        if (mounted) {
+      final maxViews = ProductEmbeddingRepository.maxViewsPerScanCode;
+      if (result.outcome == EnrollmentOutcome.enrolled ||
+          result.outcome == EnrollmentOutcome.partialLan) {
+        final n = result.localCount ??
+            await ProductEmbeddingRepository.instance.countForScanCode(scanCode);
+        if (!mounted) return;
+        if (n >= maxViews) {
           _showFusionSnack(
-            'Linked $scanCode — hold face in frame and tap Save appearance',
+            'Appearance full — Forget appearance to replace.',
           );
+          _exitAppearanceCapture();
+          return;
         }
-        return;
+        // Stay in session for another Capture.
+        setState(() {
+          _pendingVerifyCrop = null;
+          _appearanceViewCount = n;
+        });
+      } else if (result.outcome == EnrollmentOutcome.skippedAtCap) {
+        _showFusionSnack(
+          'Appearance full — Forget appearance to replace.',
+        );
+        _exitAppearanceCapture();
       }
-      await _runEnroll(
-        scanCode: scanCode,
-        skuName: _displayNameForEnroll(product, scanCode),
-        department: product.department.isNotEmpty
-            ? product.department
-            : widget.allocatedDepartment,
-        jpegBytes: cropBytes,
-        source: 'scanner',
-      );
-      _pendingEnrollCrop = null;
+      // Quality failures keep preview so user can Retake.
     } finally {
       if (mounted) setState(() => _savingAppearance = false);
     }
@@ -1001,22 +1073,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     return '(no name)';
   }
 
-  Future<void> _runEnroll({
-    required String scanCode,
-    required String skuName,
-    required String department,
-    required Uint8List jpegBytes,
-    required String source,
-  }) async {
-    final result = await _enrollment.enrollAfterConfirm(
-      scanCode: scanCode,
-      skuName: skuName,
-      jpegBytes: jpegBytes,
-      source: source,
-      department: department,
-    );
-
-    if (!mounted) return;
+  void _showEnrollResult(EnrollmentResult result, String scanCode) {
     if (result.outcome == EnrollmentOutcome.enrolled) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -1033,7 +1090,7 @@ class _LiveScanScreenState extends State<LiveScanScreen>
         SnackBar(
           content: Text(
             result.message ??
-                'Saved on phone only — LAN failed. ✨ needs sandbox.',
+                'Saved on phone only — LAN failed. On-device match still works.',
           ),
           duration: const Duration(seconds: 4),
           behavior: SnackBarBehavior.floating,
@@ -1212,7 +1269,8 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     }
 
     final controller = _cameraController;
-    final hasCard = _currentProduct != null ||
+    final hasCard = _appearanceCaptureActive ||
+        _currentProduct != null ||
         _isUnknownProduct ||
         _visualPickerCandidates != null ||
         _showUnknownVisualCard;
@@ -1497,19 +1555,21 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                       child: FadeTransition(opacity: anim, child: child),
                     ),
                     child: hasCard
-                        ? (_showUnknownVisualCard
-                            ? _buildUnknownVisualCard()
-                            : (_visualPickerCandidates != null
-                                ? _buildVisualPickerCard(
-                                    _visualPickerCandidates!)
-                                : (_currentProduct != null
-                                    ? _buildProductCard(_currentProduct!)
-                                    : (_unknownPhase ==
-                                            _UnknownSheetPhase.miniForm
-                                        ? _buildUnknownMiniForm(
-                                            _detectedCode ?? '')
-                                        : _buildUnknownPrompt(
-                                            _detectedCode ?? '')))))
+                        ? (_appearanceCaptureActive
+                            ? _buildAppearanceCaptureOverlay()
+                            : (_showUnknownVisualCard
+                                ? _buildUnknownVisualCard()
+                                : (_visualPickerCandidates != null
+                                    ? _buildVisualPickerCard(
+                                        _visualPickerCandidates!)
+                                    : (_currentProduct != null
+                                        ? _buildProductCard(_currentProduct!)
+                                        : (_unknownPhase ==
+                                                _UnknownSheetPhase.miniForm
+                                            ? _buildUnknownMiniForm(
+                                                _detectedCode ?? '')
+                                            : _buildUnknownPrompt(
+                                                _detectedCode ?? ''))))))
                         : _buildBottomHint(),
                     ),
                   ),
@@ -2245,6 +2305,242 @@ class _LiveScanScreenState extends State<LiveScanScreen>
     );
   }
 
+  /// Compact Save appearance overlay — framing guide stays visible above.
+  Widget _buildAppearanceCaptureOverlay() {
+    final product = _currentProduct;
+    final title = product != null
+        ? _productTitle(product)
+        : (_detectedCode ?? 'Product');
+    final scanCode = product?.scanCode ?? _detectedCode ?? '';
+    final preview = _pendingVerifyCrop;
+    final verifying = preview != null;
+    final maxViews = ProductEmbeddingRepository.maxViewsPerScanCode;
+    final viewsLabel = _appearanceViewCount == 1
+        ? 'Saved 1 view'
+        : 'Saved $_appearanceViewCount views';
+    final atCap = _appearanceViewCount >= maxViews;
+
+    return Container(
+      key: ValueKey(
+        verifying
+            ? 'appearance-verify-${preview.length}-$_appearanceViewCount'
+            : 'appearance-capture-$scanCode-$_appearanceViewCount',
+      ),
+      margin: const EdgeInsets.fromLTRB(10, 0, 10, 6),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.96),
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.22),
+            blurRadius: 16,
+            offset: const Offset(0, 6),
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.face_retouching_natural,
+                size: 20,
+                color: Colors.teal.shade800,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      verifying ? 'Verify face crop' : 'Save appearance',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w800,
+                        fontSize: 14,
+                        color: Colors.teal.shade900,
+                      ),
+                    ),
+                    Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.grey.shade800,
+                      ),
+                    ),
+                    Text(
+                      viewsLabel,
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.teal.shade700,
+                      ),
+                    ),
+                    if (scanCode.isNotEmpty)
+                      Text(
+                        scanCode,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 11,
+                          color: Colors.grey.shade600,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                tooltip: 'Done',
+                onPressed: _savingAppearance ? null : _exitAppearanceCapture,
+                icon: const Icon(Icons.close),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            verifying
+                ? 'Is the pack face clear in this crop?'
+                : (_appearanceViewCount > 0
+                    ? 'Capture another angle, or Done.'
+                    : 'Center the pack face in the green frame, then Capture.'),
+            style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+          ),
+          if (verifying) ...[
+            const SizedBox(height: 10),
+            Align(
+              alignment: Alignment.center,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: SizedBox(
+                  height: 140,
+                  width: 105,
+                  child: Image.memory(
+                    preview,
+                    fit: BoxFit.cover,
+                    gaplessPlayback: true,
+                  ),
+                ),
+              ),
+            ),
+          ],
+          const SizedBox(height: 12),
+          if (!verifying)
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed:
+                        _savingAppearance ? null : _exitAppearanceCapture,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.teal.shade900,
+                      side: BorderSide(color: Colors.teal.shade300),
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: const Text(
+                      'Done',
+                      style: TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 2,
+                  child: ElevatedButton.icon(
+                    onPressed: _savingAppearance || atCap
+                        ? null
+                        : () => unawaited(_onAppearanceCapturePressed()),
+                    icon: _savingAppearance
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : const Icon(Icons.camera_alt, size: 20),
+                    label: Text(
+                      _savingAppearance ? 'Capturing…' : 'Capture',
+                      style: const TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.teal.shade700,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            )
+          else
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: _savingAppearance ? null : _onAppearanceRetake,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.teal.shade900,
+                      side: BorderSide(color: Colors.teal.shade300),
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: const Text(
+                      'Retake',
+                      style: TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: _savingAppearance
+                        ? null
+                        : () => unawaited(_onAppearanceConfirm()),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.teal.shade700,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: _savingAppearance
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : const Text(
+                            'Confirm',
+                            style: TextStyle(fontWeight: FontWeight.w800),
+                          ),
+                  ),
+                ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildProductCard(StockItem p) {
     final scanCode = p.scanCode ?? _detectedCode ?? '';
     final isVisual = _scannedItemSource == 'visual';
@@ -2477,22 +2773,16 @@ class _LiveScanScreenState extends State<LiveScanScreen>
                 width: double.infinity,
                 height: 44,
                 child: OutlinedButton.icon(
-                  onPressed: _savingAppearance
+                  onPressed: _savingAppearance || _appearanceCaptureActive
                       ? null
-                      : () => unawaited(_saveAppearanceForLockedProduct()),
-                  icon: _savingAppearance
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : Icon(
-                          Icons.face_retouching_natural,
-                          size: 18,
-                          color: Colors.teal.shade800,
-                        ),
+                      : () => unawaited(_enterAppearanceCapture()),
+                  icon: Icon(
+                    Icons.face_retouching_natural,
+                    size: 18,
+                    color: Colors.teal.shade800,
+                  ),
                   label: Text(
-                    _savingAppearance ? 'Saving appearance…' : 'Save appearance',
+                    'Save appearance',
                     style: TextStyle(
                       fontWeight: FontWeight.w700,
                       color: Colors.teal.shade900,

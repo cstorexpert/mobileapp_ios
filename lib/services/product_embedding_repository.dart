@@ -9,6 +9,7 @@ import 'package:sqflite/sqflite.dart';
 ///
 /// Phase 5: on-device I2I search reads these rows when fusionBaseUrl is empty.
 /// LAN register remains the debug fuse source when the URL is set.
+/// Enrollment stores embedding blobs only (no persistent JPEG crops).
 class ProductEmbeddingRepository {
   ProductEmbeddingRepository._();
   static final ProductEmbeddingRepository instance =
@@ -16,7 +17,7 @@ class ProductEmbeddingRepository {
 
   static const String modelId = 'MobileCLIP-S2';
   static const int embeddingDim = 512;
-  static const int maxViewsPerScanCode = 5;
+  static const int maxViewsPerScanCode = 10;
 
   Database? _db;
 
@@ -113,7 +114,7 @@ class ProductEmbeddingRepository {
     return rows.map(StoredProductEmbedding.fromMap).toList();
   }
 
-  /// Deletes all local views for [scanCode] (and crop files when present).
+  /// Deletes all local views for [scanCode] (and legacy crop files when present).
   Future<int> deleteForScanCode(String scanCode) async {
     final existing = await listForScanCode(scanCode);
     for (final row in existing) {
@@ -133,21 +134,15 @@ class ProductEmbeddingRepository {
     );
   }
 
-  /// Writes JPEG under app documents for optional re-enroll / debug.
-  Future<String?> saveCropFile(String scanCode, Uint8List jpegBytes) async {
+  /// Removes legacy `product_crops/` under app documents (embeddings-only gallery).
+  Future<void> purgeAllCropFiles() async {
     try {
       final dir = await getApplicationDocumentsDirectory();
-      final folder = Directory(p.join(dir.path, 'product_crops', scanCode));
-      if (!await folder.exists()) {
-        await folder.create(recursive: true);
+      final folder = Directory(p.join(dir.path, 'product_crops'));
+      if (await folder.exists()) {
+        await folder.delete(recursive: true);
       }
-      final name = '${DateTime.now().millisecondsSinceEpoch}.jpg';
-      final file = File(p.join(folder.path, name));
-      await file.writeAsBytes(jpegBytes, flush: true);
-      return file.path;
-    } catch (_) {
-      return null;
-    }
+    } catch (_) {}
   }
 
   static Uint8List _float32ToBytes(List<double> values) {

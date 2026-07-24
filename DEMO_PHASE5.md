@@ -24,9 +24,14 @@ Teammate script for offline visual match after Phases 0–4.
 
 1. Enable airplane mode (or leave Wi‑Fi on; URL is empty so LAN is unused).
 2. Lock a product via **barcode**.
-3. Hold pack face in frame → **Save appearance** → toast **Saved appearance on phone**.
-4. Clear lock / hide barcode → tap **✨**.
-5. Expect high card or top‑3 picker with the same Excel row.
+3. Tap **Save appearance** — tall product card fades; framing guide stays visible.
+4. Center pack face → **Capture** → check preview → **Confirm** (or **Retake**).
+5. Overlay stays open (`Saved N views`) — Capture more angles, then **Done** (or auto-exits when appearance is full at 10).
+6. Product card returns for ADD.
+7. Clear lock / hide barcode → tap **✨**.
+8. Expect high card or top‑3 picker with the same Excel row.
+
+No JPEG crops are stored under app documents after Confirm (embeddings only).
 
 ## Check 3 — Unenrolled pack
 
@@ -35,8 +40,8 @@ Teammate script for offline visual match after Phases 0–4.
 
 ## Check 4 — Forget + re-enroll
 
-1. Lock enrolled product → **Forget appearance** → local cleared.
-2. ✨ should miss → Save appearance again → ✨ hits again.
+1. Lock enrolled product → **Forget appearance** → local embeddings cleared.
+2. ✨ should miss → Save appearance (Capture → Confirm) again → ✨ hits again.
 
 ## Check 5 — LAN debug still works
 

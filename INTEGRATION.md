@@ -28,9 +28,11 @@ Demo scripts: [`DEMO_PHASE4.md`](DEMO_PHASE4.md) (LAN) · [`DEMO_PHASE5.md`](DEM
 3. **High** → Visual match card; **Medium / weak (low band ≥ floor)** → top-3 picker; user still taps **ADD**.
 4. **Unknown** → **No visual match** + **Save appearance**.
 5. **Save appearance** (face-forward only):
-   - On-device: quality gate → ORT embed → SQLite (+ JPEG crop under app documents).
-   - LAN mode: also `embedCrop` + `register_sku` when URL set.
-6. **Barcode** never enrolls by itself. Cap ~5 views/code; **Forget appearance** clears local (+ LAN when URL set).
+   - Tapping **Save appearance** hides the tall product card and opens a **compact capture overlay** so the green framing guide stays visible.
+   - **Capture** → in-memory crop preview → user **Confirm** or **Retake** (human-in-the-loop). JPEG is **not** kept on disk after Confirm.
+   - On-device: quality gate → ORT embed → **SQLite embedding only**.
+   - LAN mode: also `embedCrop` + `register_sku` when URL set (JPEG sent in memory).
+6. **Barcode** never enrolls by itself. Cap ~10 views/code (overlay shows count only; hard stop at cap); **Forget appearance** clears local embeddings (+ LAN when URL set). Legacy `product_crops/` folders are purged.
 
 ### Visual gallery vs Excel (important)
 

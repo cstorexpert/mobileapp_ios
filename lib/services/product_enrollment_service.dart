@@ -62,6 +62,7 @@ class ForgetResult {
 
 /// Face-forward Save appearance: quality-gate → embed → local SQLite (+ LAN when set).
 ///
+/// JPEG is used only in memory for quality / embed / LAN register — not persisted.
 /// Never called on unconfirmed CLIP suggestions.
 class ProductEnrollmentService {
   ProductEnrollmentService({
@@ -144,15 +145,14 @@ class ProductEnrollmentService {
       }
     }
 
-    final cropPath = await _repo.saveCropFile(code, jpegBytes);
-
+    // Embeddings-only: JPEG is used in-memory for quality/embed/LAN; not persisted.
     var localStored = false;
     if (embedding != null &&
         embedding.length == ProductEmbeddingRepository.embeddingDim) {
       final id = await _repo.insertView(
         scanCode: code,
         embedding: embedding,
-        cropPath: cropPath,
+        cropPath: null,
         source: source,
       );
       localStored = id != null;
@@ -162,6 +162,8 @@ class ProductEnrollmentService {
           message: 'local insert failed (cap or dim)',
         );
       }
+      // Drop any legacy on-disk crops from older builds.
+      await _repo.purgeAllCropFiles();
     } else {
       debugPrint('[Enroll] no embedding — cannot store local vector for $code');
     }
@@ -255,6 +257,7 @@ class ProductEnrollmentService {
     }
 
     final localDeleted = await _repo.deleteForScanCode(code);
+    await _repo.purgeAllCropFiles();
     var lanCleared = false;
     String? lanMessage;
 
